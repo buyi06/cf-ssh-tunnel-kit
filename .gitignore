@@ -1,0 +1,9 @@
+# Local Cloudflare Tunnel secrets (the installer stores tokens under /etc by default)
+*.tunnel-token
+cf-ssh-tunnel.token
+.env
+.env.*
+
+# Local diagnostics and editor files
+*.log
+.DS_Store
