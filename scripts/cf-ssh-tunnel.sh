@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# cf-ssh-tunnel.sh — 安全管理 Cloudflare Tunnel 到本机 SSH（仅 systemd Linux）
-# 许可证：MIT（与本仓库一致）
+# cf-ssh-tunnel.sh — 无显示器 Linux 的 Cloudflare SSH Tunnel 小白向部署工具
+# 许可证：MIT
 set -Eeuo pipefail
 IFS=$'\n\t'
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
@@ -8,14 +8,21 @@ PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly SERVICE_NAME='cf-ssh-tunnel'
 readonly SERVICE_USER='cf-ssh-tunnel'
 readonly SERVICE_DIR='/etc/cf-ssh-tunnel'
-readonly TOKEN_FILE="${SERVICE_DIR}/token"
+readonly CONFIG_FILE="${SERVICE_DIR}/config.yml"
+readonly META_FILE="${SERVICE_DIR}/tunnel.env"
 readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-readonly MIN_VERSION='2025.4.0'
 readonly EDGE_HOST_1='region1.v2.argotunnel.com'
 readonly EDGE_HOST_2='region2.v2.argotunnel.com'
 
 CF_BIN=''
 PACKAGE_MANAGER=''
+TUNNEL_UUID=''
+TUNNEL_NAME=''
+PUBLIC_HOSTNAME=''
+PROTOCOL='auto'
+LOGIN_HOME=''
+CERT_FILE=''
+TUNNEL_CREATED=0
 
 say() { printf '%s\n' "$*"; }
 info() { say "[信息] $*"; }
@@ -24,53 +31,59 @@ error() { say "[错误] $*" >&2; }
 die() { error "$*"; exit 1; }
 
 on_error() {
-  local exit_code=$?
-  error "操作未完成（退出码 ${exit_code}）。未打印或记录隧道令牌。请运行 '$0 diagnose' 查看本机诊断信息。"
-  exit "$exit_code"
+  local code=$?
+  if [[ -n "$TUNNEL_UUID" && "$TUNNEL_CREATED" -eq 1 ]]; then
+    warn "本次已创建 Tunnel：${TUNNEL_UUID}。若流程未完成，请在 Cloudflare 控制台删除它及对应 DNS 路由。"
+  fi
+  error "操作未完成（退出码 ${code}）。可执行 '$0 diagnose' 检查本机网络与服务日志。"
+  exit "$code"
 }
 trap on_error ERR
+
+cleanup_login_certificate() {
+  if [[ -n "$LOGIN_HOME" && -d "$LOGIN_HOME" ]]; then
+    rm -rf "$LOGIN_HOME"
+  fi
+}
+trap cleanup_login_certificate EXIT
 
 usage() {
   cat <<'EOF'
 用法：
   sudo bash cf-ssh-tunnel.sh install [--mainland|--auto|--quic]
-  sudo bash cf-ssh-tunnel.sh rotate-token
   sudo bash cf-ssh-tunnel.sh status
   sudo bash cf-ssh-tunnel.sh diagnose
   sudo bash cf-ssh-tunnel.sh update
-  sudo bash cf-ssh-tunnel.sh client-config <ssh.example.com>
+  bash cf-ssh-tunnel.sh client-config [ssh.example.com]
   sudo bash cf-ssh-tunnel.sh uninstall
 
-命令说明：
-  install        安装官方 cloudflared、保存令牌到受限文件并启用 systemd 服务。
-  --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络；不保证中国大陆网络可达。
-  --auto         让 cloudflared 先尝试 QUIC，失败时回退 HTTP/2（默认）。
-  --quic         固定使用 QUIC（UDP/7844）。
-  rotate-token   通过隐藏输入更新令牌并原子重启服务。
-  status         显示服务、版本、令牌文件权限与 SSH 监听状态；不显示令牌。
-  diagnose       检查 DNS、TCP/7844、SSH 和最近日志；不改变配置。
-  update         使用系统包管理器更新 cloudflared；不重启服务、不更改令牌。
-  client-config  输出客户端 ~/.ssh/config 示例。客户端也必须安装 cloudflared。
-  uninstall      仅删除本脚本创建的服务和本地令牌，不删除 Cloudflare 控制台中的 Tunnel。
+最简单的安装方式：
+  sudo bash cf-ssh-tunnel.sh install --mainland
 
-安全模型：
-  本脚本不开放服务器入站端口，不修改 sshd 配置，不创建公开 SSH 入口。
-  请在 Cloudflare 控制台将 Published application 的服务设置为 ssh://localhost:22，
-  并创建 Cloudflare Access 自托管应用和最小化身份策略后再连接。
+命令说明：
+  install        自动检测/安装 cloudflared，输出浏览器授权链接，随后询问域名并自动创建 Tunnel、DNS 路由、SSH 配置和系统服务。
+  --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络。
+  --auto         先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2（默认）。
+  --quic         固定使用 QUIC（UDP/7844）。
+  status         显示 Tunnel 名称、域名、服务状态和本机 SSH 状态。
+  diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
+  update         使用系统包管理器更新 cloudflared。
+  client-config  输出 SSH 客户端配置；不带域名时自动读取本机配置。
+  uninstall      仅删除本机服务和凭据；不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。
+
+安全说明：
+  本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
+  脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；Cloudflare Access 身份策略仍需由账号管理员确认配置。
 EOF
 }
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "请以 root 运行，例如：sudo bash $0 <命令>"
+  [[ "${EUID}" -eq 0 ]] || die "请以 root 运行，例如：sudo bash $0 install"
 }
 
 require_systemd() {
-  command -v systemctl >/dev/null 2>&1 || die "该脚本需要 systemd；当前系统未检测到 systemctl。"
-  [[ -d /run/systemd/system ]] || die "当前环境不是已运行的 systemd 系统，无法可靠托管隧道服务。"
-}
-
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "缺少必要命令：$1"
+  command -v systemctl >/dev/null 2>&1 || die '当前系统未检测到 systemctl；本脚本仅支持 systemd Linux。'
+  [[ -d /run/systemd/system ]] || die '当前环境不是正在运行的 systemd 系统，无法可靠托管 Tunnel 服务。'
 }
 
 detect_package_manager() {
@@ -85,8 +98,14 @@ detect_package_manager() {
   elif command -v apk >/dev/null 2>&1; then
     PACKAGE_MANAGER='apk'
   else
-    die "不支持的包管理器。支持 apt、dnf、yum、pacman 和 apk。"
+    die '未识别包管理器。支持 apt、dnf、yum、pacman 和 apk。'
   fi
+}
+
+curl_secure() {
+  curl --fail --show-error --silent --location \
+    --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 "$@"
 }
 
 install_prerequisites() {
@@ -96,13 +115,10 @@ install_prerequisites() {
       DEBIAN_FRONTEND=noninteractive apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl
       ;;
-    dnf)
-      dnf -y install ca-certificates curl
-      ;;
-    yum)
-      yum -y install ca-certificates curl
-      ;;
+    dnf) dnf -y install ca-certificates curl ;;
+    yum) yum -y install ca-certificates curl ;;
     pacman)
+      warn 'Arch Linux 将执行完整系统更新，以避免部分升级。'
       pacman -Syu --needed --noconfirm ca-certificates curl
       ;;
     apk)
@@ -112,45 +128,17 @@ install_prerequisites() {
   esac
 }
 
-curl_secure() {
-  # 仅请求 HTTPS，限制重试与超时；调用方负责指定 -o <临时文件>。
-  curl --fail --show-error --silent --location \
-    --proto '=https' --tlsv1.2 \
-    --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 "$@"
-}
-
 find_cloudflared() {
   CF_BIN="$(command -v cloudflared || true)"
-  [[ -n "$CF_BIN" ]] || die "未找到 cloudflared 可执行文件。"
-  [[ -x "$CF_BIN" ]] || die "cloudflared 不可执行：$CF_BIN"
-}
-
-version_ge() {
-  # 比较 yyyy.m.p 格式版本：version_ge <actual> <minimum>
-  local actual="$1" minimum="$2"
-  local -a a b
-  local i
-  IFS='.' read -r -a a <<<"$actual"
-  IFS='.' read -r -a b <<<"$minimum"
-  for i in 0 1 2; do
-    [[ "${a[$i]:-0}" =~ ^[0-9]+$ && "${b[$i]:-0}" =~ ^[0-9]+$ ]] || return 1
-    if (( 10#${a[$i]:-0} > 10#${b[$i]:-0} )); then return 0; fi
-    if (( 10#${a[$i]:-0} < 10#${b[$i]:-0} )); then return 1; fi
-  done
+  [[ -n "$CF_BIN" && -x "$CF_BIN" ]] || return 1
   return 0
 }
 
-require_supported_cloudflared() {
-  find_cloudflared
-  local output version
-  output="$($CF_BIN --version 2>&1)"
-  if [[ "$output" =~ ([0-9]{4}\.[0-9]+\.[0-9]+) ]]; then
-    version="${BASH_REMATCH[1]}"
-  else
-    die "无法解析 cloudflared 版本：$output"
-  fi
-  version_ge "$version" "$MIN_VERSION" || die "cloudflared ${version} 过旧；需要 ${MIN_VERSION} 或更新版本以安全使用 --token-file。"
-  info "cloudflared 版本：${version}（满足令牌文件要求）"
+show_cloudflared_version() {
+  local output
+  output="$($CF_BIN --version 2>&1 || true)"
+  [[ -n "$output" ]] || die 'cloudflared 无法正常执行。'
+  info "已检测到 cloudflared，跳过安装：${output}"
 }
 
 install_cloudflared() {
@@ -158,13 +146,12 @@ install_cloudflared() {
   local tmp
   case "$PACKAGE_MANAGER" in
     apt)
-      info "配置 Cloudflare 官方 APT 软件包仓库。"
+      info '正在配置 Cloudflare 官方 APT 软件源并安装 cloudflared。'
       install -d -o root -g root -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
       tmp="$(mktemp)"
       curl_secure -o "$tmp" 'https://pkg.cloudflare.com/cloudflare-main.gpg'
       install -o root -g root -m 0644 "$tmp" /usr/share/keyrings/cloudflare-main.gpg
       rm -f "$tmp"
-      tmp="$(mktemp)"
       printf '%s\n' 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' >"$tmp"
       install -o root -g root -m 0644 "$tmp" /etc/apt/sources.list.d/cloudflared.list
       rm -f "$tmp"
@@ -172,39 +159,38 @@ install_cloudflared() {
       DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
       ;;
     dnf|yum)
-      info "配置 Cloudflare 官方 RPM 软件包仓库。"
+      info '正在配置 Cloudflare 官方 RPM 软件源并安装 cloudflared。'
       install -d -o root -g root -m 0755 /etc/yum.repos.d
       tmp="$(mktemp)"
       curl_secure -o "$tmp" 'https://pkg.cloudflare.com/cloudflared.repo'
       install -o root -g root -m 0644 "$tmp" /etc/yum.repos.d/cloudflared.repo
       rm -f "$tmp"
-      if [[ "$PACKAGE_MANAGER" == 'dnf' ]]; then
-        dnf -y install cloudflared
-      else
-        yum -y install cloudflared
-      fi
+      if [[ "$PACKAGE_MANAGER" == 'dnf' ]]; then dnf -y install cloudflared; else yum -y install cloudflared; fi
       ;;
-    pacman)
-      warn "Arch 将执行完整系统更新，以避免部分升级。"
-      pacman -Syu --needed --noconfirm cloudflared
-      ;;
-    apk)
-      apk add --no-cache cloudflared
-      ;;
+    pacman) pacman -Syu --needed --noconfirm cloudflared ;;
+    apk) apk add --no-cache cloudflared ;;
   esac
-  require_supported_cloudflared
+  find_cloudflared || die 'cloudflared 安装完成后仍未找到可执行文件。'
+  info "cloudflared 已安装：$($CF_BIN --version 2>&1)"
+}
+
+ensure_cloudflared() {
+  if find_cloudflared; then
+    show_cloudflared_version
+  else
+    info '未安装 cloudflared，开始自动安装。'
+    install_cloudflared
+  fi
 }
 
 ensure_service_user() {
-  if id "$SERVICE_USER" >/dev/null 2>&1; then
-    return 0
-  fi
+  id "$SERVICE_USER" >/dev/null 2>&1 && return 0
   if command -v useradd >/dev/null 2>&1; then
     useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin "$SERVICE_USER"
   elif command -v adduser >/dev/null 2>&1; then
     adduser -S -H -s /sbin/nologin "$SERVICE_USER"
   else
-    die "无法创建受限服务账户（未找到 useradd/adduser）。"
+    die '无法创建受限服务账户（未找到 useradd 或 adduser）。'
   fi
 }
 
@@ -215,20 +201,18 @@ probe_dns() {
   elif command -v nslookup >/dev/null 2>&1; then
     nslookup "$host" >/dev/null 2>&1
   else
-    warn "未找到 getent 或 nslookup，跳过 DNS 预检。"
+    warn '未找到 getent 或 nslookup，跳过 DNS 预检。'
     return 0
   fi
 }
 
 probe_tcp_7844() {
   local host="$1"
-  # /dev/tcp 是 Bash 内建能力；只进行 TCP 三次握手，不发送业务数据。
   timeout 6 bash -c "exec 3<>/dev/tcp/${host}/7844" >/dev/null 2>&1
 }
 
 check_network() {
-  local host
-  local dns_ok=0 tcp_ok=0
+  local host dns_ok=0 tcp_ok=0
   for host in "$EDGE_HOST_1" "$EDGE_HOST_2"; do
     if probe_dns "$host"; then
       info "DNS 可解析：${host}"
@@ -237,72 +221,174 @@ check_network() {
       warn "DNS 解析失败：${host}"
     fi
   done
-  (( dns_ok == 1 )) || die "无法解析 Cloudflare Tunnel 边缘域名。请先检查服务器 DNS。"
+  (( dns_ok == 1 )) || die '无法解析 Cloudflare Tunnel 边缘域名，请先检查服务器 DNS。'
 
   for host in "$EDGE_HOST_1" "$EDGE_HOST_2"; do
     if probe_tcp_7844 "$host"; then
-      info "TCP/7844 连通：${host}"
+      info "TCP/7844 可连接：${host}"
       tcp_ok=1
     else
       warn "TCP/7844 不通：${host}"
     fi
   done
-  (( tcp_ok == 1 )) || die "无法连接 Cloudflare 的 TCP/7844。隧道无法建立；请检查上游防火墙、出口策略或所在网络限制。"
+  (( tcp_ok == 1 )) || die '无法连接 Cloudflare TCP/7844；请检查防火墙、出口策略或所在网络限制。'
 }
 
 check_local_ssh() {
-  local ssh_service=''
-  if systemctl is-active --quiet ssh; then ssh_service='ssh'; fi
-  if systemctl is-active --quiet sshd; then ssh_service='sshd'; fi
-  if [[ -z "$ssh_service" ]]; then
+  local unit=''
+  if systemctl is-active --quiet ssh; then unit='ssh'; fi
+  if systemctl is-active --quiet sshd; then unit='sshd'; fi
+  if [[ -z "$unit" ]]; then
     warn '未检测到运行中的 SSH 服务（ssh/sshd）。请先安装并启动 SSH。'
     return 1
   fi
-
-  if command -v ss >/dev/null 2>&1; then
-    if ss -lntH '( sport = :22 )' 2>/dev/null | grep -q .; then
-      info "本机 SSH 正在监听 22 端口（服务：${ssh_service}）。"
-      return 0
-    fi
+  if command -v ss >/dev/null 2>&1 && ss -lntH '( sport = :22 )' 2>/dev/null | grep -q .; then
+    info "本机 SSH 正在监听 22 端口（服务：${unit}）。"
+  else
+    warn 'SSH 服务已运行，但未能确认 22 端口监听；请确认 sshd 端口确为 22。'
   fi
-  warn 'SSH 服务处于运行状态，但未能确认 22 端口监听。请确认 Cloudflare 控制台服务地址与实际 sshd 端口一致。'
   return 0
 }
 
-read_token() {
-  local prompt="$1"
-  local token confirm
-  say >&2
-  say '请从 Cloudflare 控制台的 Tunnel 安装命令中仅复制 eyJ... 令牌字符串。' >&2
-  say '令牌不会显示、不会写入日志、不会置于 systemd 命令行或环境变量。' >&2
-  read -r -s -p "$prompt" token
-  say >&2
-  [[ -n "$token" ]] || die '令牌不能为空。'
-  [[ "$token" == eyJ* && "$token" =~ ^[A-Za-z0-9._~+=-]+$ && ${#token} -ge 80 ]] || die '令牌格式无效。请只粘贴安装命令中的 eyJ... 令牌，不要粘贴整条命令。'
-  read -r -s -p '再次输入以确认：' confirm
-  say >&2
-  [[ "$token" == "$confirm" ]] || die '两次输入的令牌不一致。'
-  printf '%s' "$token"
+validate_hostname() {
+  local host="$1"
+  [[ ${#host} -le 253 && "$host" == *.* ]] || return 1
+  [[ "$host" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
 }
 
-write_token_atomically() {
-  local token="$1" tmp
+read_hostname() {
+  local input
+  while true; do
+    read -r -p '请输入用于 SSH 的完整域名（例如 ssh.example.com）：' input
+    input="${input,,}"
+    if validate_hostname "$input"; then
+      PUBLIC_HOSTNAME="$input"
+      return 0
+    fi
+    warn '域名格式不正确。请填写完整域名，例如 ssh.example.com。'
+  done
+}
+
+make_tunnel_name() {
+  local hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$PUBLIC_HOSTNAME" | sha256sum | cut -c1-10)"
+  else
+    hash="$(printf '%s' "$PUBLIC_HOSTNAME" | cksum | awk '{print $1}')"
+  fi
+  TUNNEL_NAME="ssh-${hash}"
+}
+
+login_to_cloudflare() {
+  LOGIN_HOME="$(mktemp -d /root/.cf-ssh-tunnel-login.XXXXXX)"
+  chmod 0700 "$LOGIN_HOME"
+  CERT_FILE="${LOGIN_HOME}/.cloudflared/cert.pem"
+
+  say
+  say '第 1 步：Cloudflare 浏览器授权'
+  say '接下来 cloudflared 会在本终端输出一条 https:// 开头的授权链接。'
+  say '请复制该链接，在任意可以使用浏览器的设备上打开，登录 Cloudflare，并选择包含目标域名的站点。'
+  say '授权完成前请不要关闭本终端；完成后脚本会自动继续。'
+  say
+
+  if ! HOME="$LOGIN_HOME" "$CF_BIN" tunnel login; then
+    die 'Cloudflare 授权未完成。请重新执行 install，并在浏览器中完成链接授权。'
+  fi
+  [[ -s "$CERT_FILE" ]] || die '未取得 Cloudflare 授权证书。请确认浏览器中已完成授权并选择了站点。'
+  chmod 0600 "$CERT_FILE"
+  info 'Cloudflare 授权成功。'
+}
+
+create_tunnel() {
+  local output credential_source
+  make_tunnel_name
+  info "第 2 步：正在创建 Tunnel（名称：${TUNNEL_NAME}）。"
+  if ! output="$(HOME="$LOGIN_HOME" "$CF_BIN" tunnel --origincert "$CERT_FILE" create "$TUNNEL_NAME" 2>&1)"; then
+    error "$output"
+    die '创建 Tunnel 失败。请确认授权账号对该 Cloudflare 账户具有 Tunnel 管理权限。'
+  fi
+  if [[ "$output" =~ ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then
+    TUNNEL_UUID="${BASH_REMATCH[1],,}"
+  else
+    error "$output"
+    die 'Tunnel 已创建，但脚本无法识别其 UUID；为避免错误配置，已停止。请在 Cloudflare 控制台查看后删除该 Tunnel。'
+  fi
+  TUNNEL_CREATED=1
+  credential_source="${LOGIN_HOME}/.cloudflared/${TUNNEL_UUID}.json"
+  [[ -s "$credential_source" ]] || die "未找到 Tunnel 凭据文件：${credential_source}"
+
   install -d -o root -g "$SERVICE_USER" -m 0750 "$SERVICE_DIR"
-  tmp="$(mktemp "${SERVICE_DIR}/.token.XXXXXX")"
-  umask 0077
-  if ! { printf '%s' "$token" >"$tmp" && chown root:"$SERVICE_USER" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$TOKEN_FILE"; }; then
-    rm -f "$tmp"
-    die '无法安全保存 Tunnel 令牌。'
+  install -o root -g "$SERVICE_USER" -m 0640 "$credential_source" "${SERVICE_DIR}/${TUNNEL_UUID}.json"
+  info "Tunnel 已创建（UUID：${TUNNEL_UUID}）。"
+}
+
+write_config() {
+  local temp_config="${SERVICE_DIR}/.config.yml.XXXXXX"
+  local tmp
+  tmp="$(mktemp "$temp_config")"
+  cat >"$tmp" <<EOF
+# 由 cf-ssh-tunnel-kit 自动生成，请勿将凭据文件上传至 Git。
+tunnel: ${TUNNEL_UUID}
+credentials-file: ${SERVICE_DIR}/${TUNNEL_UUID}.json
+
+ingress:
+  - hostname: ${PUBLIC_HOSTNAME}
+    service: ssh://localhost:22
+  - service: http_status:404
+EOF
+  install -o root -g "$SERVICE_USER" -m 0640 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+
+  if ! "$CF_BIN" tunnel --config "$CONFIG_FILE" ingress validate; then
+    die '自动生成的 SSH 路由配置未通过 cloudflared 校验。'
   fi
 }
 
+create_dns_route() {
+  info "第 3 步：正在自动创建 DNS 路由：${PUBLIC_HOSTNAME}。"
+  if ! "$CF_BIN" tunnel --origincert "$CERT_FILE" route dns "$TUNNEL_UUID" "$PUBLIC_HOSTNAME"; then
+    die '自动创建 DNS 路由失败。请确认该域名已托管至 Cloudflare，且授权时选择了正确站点。'
+  fi
+  info "DNS 路由已创建：${PUBLIC_HOSTNAME} -> ${TUNNEL_UUID}.cfargotunnel.com"
+}
+
+write_metadata() {
+  local tmp
+  tmp="$(mktemp "${SERVICE_DIR}/.tunnel.env.XXXXXX")"
+  cat >"$tmp" <<EOF
+TUNNEL_UUID=${TUNNEL_UUID}
+TUNNEL_NAME=${TUNNEL_NAME}
+PUBLIC_HOSTNAME=${PUBLIC_HOSTNAME}
+PROTOCOL=${PROTOCOL}
+EOF
+  install -o root -g root -m 0600 "$tmp" "$META_FILE"
+  rm -f "$tmp"
+}
+
+read_metadata() {
+  [[ -r "$META_FILE" ]] || return 1
+  TUNNEL_UUID=''
+  TUNNEL_NAME=''
+  PUBLIC_HOSTNAME=''
+  PROTOCOL='auto'
+  while IFS='=' read -r key value; do
+    case "$key" in
+      TUNNEL_UUID) TUNNEL_UUID="$value" ;;
+      TUNNEL_NAME) TUNNEL_NAME="$value" ;;
+      PUBLIC_HOSTNAME) PUBLIC_HOSTNAME="$value" ;;
+      PROTOCOL) PROTOCOL="$value" ;;
+    esac
+  done <"$META_FILE"
+  [[ -n "$TUNNEL_UUID" && -n "$PUBLIC_HOSTNAME" ]]
+}
+
 write_unit() {
-  local protocol="$1" tmp
-  case "$protocol" in auto|http2|quic) ;; *) die "无效协议：$protocol" ;; esac
+  local tmp
+  case "$PROTOCOL" in auto|http2|quic) ;; *) die "无效协议：${PROTOCOL}" ;; esac
   tmp="$(mktemp)"
   cat >"$tmp" <<EOF
 [Unit]
-Description=Cloudflare Tunnel for local SSH (managed by cf-ssh-tunnel)
+Description=Cloudflare Tunnel for local SSH (managed by cf-ssh-tunnel-kit)
 Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/
 Wants=network-online.target
 After=network-online.target
@@ -313,7 +399,8 @@ StartLimitBurst=5
 Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
-ExecStart=${CF_BIN} tunnel --no-autoupdate --protocol ${protocol} --edge-ip-version auto --retries 5 run --token-file ${TOKEN_FILE}
+WorkingDirectory=${SERVICE_DIR}
+ExecStart=${CF_BIN} tunnel --no-autoupdate --config ${CONFIG_FILE} --protocol ${PROTOCOL} --edge-ip-version auto --retries 5 run ${TUNNEL_UUID}
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
@@ -339,34 +426,46 @@ EOF
   rm -f "$tmp"
 }
 
-show_mainland_notice() {
-  say
-  warn '中国大陆兼容模式只会强制使用 HTTP/2（TCP/7844），以避免依赖 UDP/QUIC。'
-  warn '它不能保证 Cloudflare Tunnel、DNS 或 Access 登录在任何网络中可达，也不会自动改用第三方中继。'
-  say
-}
-
 wait_for_service() {
   local i
-  for i in {1..12}; do
+  for ((i = 0; i < 15; i++)); do
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-      info "服务已启动。"
+      info 'Tunnel 服务已启动。'
       return 0
     fi
     sleep 1
   done
-  error "服务未能在 12 秒内启动。以下为最近日志："
-  journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
-  die "请核对 Tunnel 令牌、Cloudflare 控制台状态与 TCP/7844 出站连通性。"
+  error '服务未能在 15 秒内启动，以下为最近日志：'
+  journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
+  die 'Tunnel 服务启动失败。请执行 diagnose 查看网络和日志。'
+}
+
+show_access_notice() {
+  say
+  say '第 4 步：Tunnel 已自动配置完成。'
+  say "SSH 域名：${PUBLIC_HOSTNAME}"
+  say
+  warn '为避免任何人访问 SSH，请在 Cloudflare Zero Trust → Access → Applications 中为该域名创建 Self-hosted 应用，并仅允许你的账号或指定用户组。'
+  say '这是身份策略配置，脚本不会猜测你的登录方式，也不会默认开放 SSH。'
+  say "完成后，在客户端运行：bash $0 client-config ${PUBLIC_HOSTNAME}"
+  say
+  info '为降低风险，授权期间使用的账户级证书已自动删除；运行服务只保留本 Tunnel 的专用凭据。'
+}
+
+show_mainland_notice() {
+  say
+  warn '中国大陆模式已启用：Tunnel 将固定使用 HTTP/2（TCP/7844），不依赖 UDP/QUIC。'
+  warn '它无法保证任意网络均能连接；若 TCP/7844 或 DNS 不可达，Cloudflare Tunnel 无法建立。'
+  say
 }
 
 install_tunnel() {
-  local protocol='auto'
+  PROTOCOL='auto'
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mainland) protocol='http2' ;;
-      --auto) protocol='auto' ;;
-      --quic) protocol='quic' ;;
+      --mainland) PROTOCOL='http2' ;;
+      --auto) PROTOCOL='auto' ;;
+      --quic) PROTOCOL='quic' ;;
       -h|--help) usage; return 0 ;;
       *) die "未知 install 选项：$1" ;;
     esac
@@ -375,141 +474,136 @@ install_tunnel() {
 
   require_root
   require_systemd
-  [[ ! -e "$UNIT_FILE" ]] || die "已存在 ${SERVICE_NAME} 服务。请使用 rotate-token、status、update 或先 uninstall。"
+  [[ ! -e "$UNIT_FILE" && ! -e "$META_FILE" ]] || die "已存在 ${SERVICE_NAME} 配置。请使用 status、diagnose、update 或先 uninstall。"
+  ensure_cloudflared
   check_network
-  check_local_ssh || die 'SSH 未就绪，拒绝创建一个没有本机 SSH 服务的 Tunnel。'
-  install_cloudflared
+  check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
   ensure_service_user
-  if [[ "$protocol" == 'http2' ]]; then show_mainland_notice; fi
+  [[ "$PROTOCOL" == 'http2' ]] && show_mainland_notice
 
-  local token
-  token="$(read_token '粘贴 Tunnel 令牌（输入隐藏）：')"
-  write_token_atomically "$token"
-  unset token
-  write_unit "$protocol"
+  login_to_cloudflare
+  read_hostname
+  create_tunnel
+  write_config
+  create_dns_route
+  write_metadata
+  write_unit
   systemctl daemon-reload
   systemctl enable --now "$SERVICE_NAME"
   wait_for_service
-
-  say
-  info '安装完成：本机未开放任何新的入站端口。'
-  say '下一步请在 Cloudflare 控制台配置 Published application：'
-  say '  主机名：ssh.你的域名'
-  say '  服务：ssh://localhost:22'
-  say '并为该主机名创建 Cloudflare Access 自托管应用与最小化身份策略。'
-  say "随后在客户端运行：sudo bash $0 client-config ssh.你的域名"
+  show_access_notice
 }
 
 status_tunnel() {
   require_root
   require_systemd
-  if [[ ! -e "$UNIT_FILE" ]]; then
-    warn "未发现 ${SERVICE_NAME} 服务。"
+  if ! read_metadata; then
+    warn "未发现 ${SERVICE_NAME} 的本地配置。"
     return 1
   fi
-  find_cloudflared
-  say "服务：${SERVICE_NAME}"
+  ensure_cloudflared
+  say "Tunnel 名称：${TUNNEL_NAME:-未知}"
+  say "Tunnel UUID：${TUNNEL_UUID}"
+  say "SSH 域名：${PUBLIC_HOSTNAME}"
+  say "传输协议：${PROTOCOL}"
+  say "凭据文件权限：$(stat -c '%a %U:%G %n' "${SERVICE_DIR}/${TUNNEL_UUID}.json" 2>/dev/null || echo '文件缺失')"
+  say
   systemctl --no-pager --full status "$SERVICE_NAME" || true
   say
-  say "cloudflared：$($CF_BIN --version 2>&1 || true)"
-  if [[ -e "$TOKEN_FILE" ]]; then
-    say "令牌文件权限：$(stat -c '%a %U:%G %n' "$TOKEN_FILE")"
-  else
-    warn "令牌文件缺失：${TOKEN_FILE}"
-  fi
   check_local_ssh || true
 }
 
 diagnose_tunnel() {
   require_root
   require_systemd
-  say '== Cloudflare Tunnel DNS 预检 =='
-  probe_dns "$EDGE_HOST_1" && info "DNS 正常：$EDGE_HOST_1" || warn "DNS 异常：$EDGE_HOST_1"
-  probe_dns "$EDGE_HOST_2" && info "DNS 正常：$EDGE_HOST_2" || warn "DNS 异常：$EDGE_HOST_2"
+  say '== Cloudflare DNS 预检 =='
+  if probe_dns "$EDGE_HOST_1"; then info "DNS 正常：${EDGE_HOST_1}"; else warn "DNS 异常：${EDGE_HOST_1}"; fi
+  if probe_dns "$EDGE_HOST_2"; then info "DNS 正常：${EDGE_HOST_2}"; else warn "DNS 异常：${EDGE_HOST_2}"; fi
   say
-  say '== Cloudflare Tunnel TCP/7844 预检 =='
-  probe_tcp_7844 "$EDGE_HOST_1" && info "TCP 正常：$EDGE_HOST_1:7844" || warn "TCP 失败：$EDGE_HOST_1:7844"
-  probe_tcp_7844 "$EDGE_HOST_2" && info "TCP 正常：$EDGE_HOST_2:7844" || warn "TCP 失败：$EDGE_HOST_2:7844"
+  say '== Cloudflare TCP/7844 预检 =='
+  if probe_tcp_7844 "$EDGE_HOST_1"; then info "TCP 正常：${EDGE_HOST_1}:7844"; else warn "TCP 失败：${EDGE_HOST_1}:7844"; fi
+  if probe_tcp_7844 "$EDGE_HOST_2"; then info "TCP 正常：${EDGE_HOST_2}:7844"; else warn "TCP 失败：${EDGE_HOST_2}:7844"; fi
   say
   say '== 本机 SSH 检查 =='
   check_local_ssh || true
   say
-  say '== 服务状态 =='
+  say '== Tunnel 本地配置 =='
+  if read_metadata; then
+    say "SSH 域名：${PUBLIC_HOSTNAME}"
+    say "Tunnel UUID：${TUNNEL_UUID}"
+  else
+    warn '未发现本地 Tunnel 元数据。'
+  fi
+  say
+  say '== 服务状态与日志 =='
   if [[ -e "$UNIT_FILE" ]]; then
     systemctl --no-pager --full status "$SERVICE_NAME" || true
-    say
-    say '== 最近 80 行服务日志 =='
     journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
   else
     warn "未安装 ${SERVICE_NAME} 服务。"
   fi
 }
 
-rotate_token() {
-  require_root
-  require_systemd
-  [[ -e "$UNIT_FILE" ]] || die "未发现 ${SERVICE_NAME} 服务。"
-  [[ -e "$TOKEN_FILE" ]] || die "令牌文件缺失；为避免误操作，请先 uninstall 后重新 install。"
-  local token
-  token="$(read_token '粘贴新的 Tunnel 令牌（输入隐藏）：')"
-  write_token_atomically "$token"
-  unset token
-  systemctl restart "$SERVICE_NAME"
-  wait_for_service
-  info '令牌已更新。请在 Cloudflare 控制台确认旧令牌已按你的轮换策略失效。'
-}
-
 update_cloudflared() {
   require_root
+  if ! find_cloudflared; then
+    info '未安装 cloudflared，将直接执行自动安装。'
+    install_cloudflared
+    return 0
+  fi
   install_prerequisites
   case "$PACKAGE_MANAGER" in
     apt)
       DEBIAN_FRONTEND=noninteractive apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade cloudflared
       ;;
-    dnf)
-      dnf -y upgrade cloudflared
-      ;;
-    yum)
-      yum -y update cloudflared
-      ;;
+    dnf) dnf -y upgrade cloudflared ;;
+    yum) yum -y update cloudflared ;;
     pacman)
-      warn "Arch 将执行完整系统更新，以避免部分升级。"
+      warn 'Arch Linux 将执行完整系统更新，以避免部分升级。'
       pacman -Syu --needed --noconfirm cloudflared
       ;;
-    apk)
-      apk upgrade cloudflared
-      ;;
+    apk) apk upgrade cloudflared ;;
   esac
-  require_supported_cloudflared
-  info '更新完成。服务未自动重启；请在维护窗口执行：systemctl restart cf-ssh-tunnel'
+  find_cloudflared || die 'cloudflared 更新后不可用。'
+  info "更新完成：$($CF_BIN --version 2>&1)"
+  info "如需立即加载新版本，请执行：systemctl restart ${SERVICE_NAME}"
 }
 
 client_config() {
   local hostname="${1:-}"
-  [[ -n "$hostname" ]] || die '请提供 SSH 主机名，例如：client-config ssh.example.com'
-  [[ "$hostname" =~ ^[A-Za-z0-9.-]+$ && "$hostname" == *.* ]] || die '主机名格式无效。'
+  if [[ -z "$hostname" ]] && [[ -r "$META_FILE" ]]; then
+    read_metadata || true
+    hostname="$PUBLIC_HOSTNAME"
+  fi
+  [[ -n "$hostname" ]] || die '请提供 SSH 域名，例如：client-config ssh.example.com'
+  hostname="${hostname,,}"
+  validate_hostname "$hostname" || die '域名格式无效，例如 ssh.example.com。'
   cat <<EOF
-将以下内容加入客户端的 ~/.ssh/config（客户端需已安装 cloudflared）：
+请将以下内容加入 SSH 客户端的 ~/.ssh/config（客户端也需安装 cloudflared）：
 
 Host ${hostname}
     HostName ${hostname}
     User <你的 Linux 用户名>
     ProxyCommand cloudflared access ssh --hostname %h
 
-随后运行：
+连接命令：
   ssh <你的 Linux 用户名>@${hostname}
 
 首次连接时，cloudflared 会打开浏览器完成 Cloudflare Access 身份验证。
+请先在 Cloudflare Zero Trust 中为 ${hostname} 配置 Access Self-hosted 应用和最小化访问策略。
 EOF
 }
 
 uninstall_tunnel() {
   require_root
   require_systemd
-  [[ -e "$UNIT_FILE" || -e "$SERVICE_DIR" ]] || die "未发现本脚本创建的本地配置。"
-  say '此操作只会停止并删除本脚本创建的 systemd 服务与本地令牌。'
-  say '它不会删除 Cloudflare 控制台中的 Tunnel、路由或 Access 策略，也不会卸载 cloudflared。'
+  [[ -e "$UNIT_FILE" || -e "$SERVICE_DIR" ]] || die '未发现本脚本创建的本地配置。'
+  local old_uuid=''
+  if read_metadata; then old_uuid="$TUNNEL_UUID"; fi
+  say '该操作将停止并删除本机 systemd 服务、配置和 Tunnel 专用凭据。'
+  say '为避免账户级误删，它不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。'
+  [[ -n "$old_uuid" ]] && say "如不再使用，请在 Cloudflare 控制台删除 Tunnel：${old_uuid}"
   local answer
   read -r -p '若确认，请输入 DELETE：' answer
   [[ "$answer" == 'DELETE' ]] || die '已取消。'
@@ -518,13 +612,11 @@ uninstall_tunnel() {
   rm -rf "$SERVICE_DIR"
   systemctl daemon-reload
   if id "$SERVICE_USER" >/dev/null 2>&1; then
-    if command -v userdel >/dev/null 2>&1; then
-      userdel "$SERVICE_USER" 2>/dev/null || true
-    elif command -v deluser >/dev/null 2>&1; then
-      deluser "$SERVICE_USER" 2>/dev/null || true
+    if command -v userdel >/dev/null 2>&1; then userdel "$SERVICE_USER" 2>/dev/null || true
+    elif command -v deluser >/dev/null 2>&1; then deluser "$SERVICE_USER" 2>/dev/null || true
     fi
   fi
-  info '本地服务与令牌已删除。请在 Cloudflare 控制台删除或停用不再需要的 Tunnel。'
+  info '本机 Tunnel 服务和专用凭据已删除。'
 }
 
 main() {
@@ -532,14 +624,13 @@ main() {
   shift || true
   case "$command" in
     install) install_tunnel "$@" ;;
-    rotate-token) [[ $# -eq 0 ]] || die 'rotate-token 不接受额外参数。'; rotate_token ;;
     status) [[ $# -eq 0 ]] || die 'status 不接受额外参数。'; status_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
-    client-config) [[ $# -eq 1 ]] || die 'client-config 需要一个主机名参数。'; client_config "$1" ;;
+    client-config) [[ $# -le 1 ]] || die 'client-config 最多接受一个域名参数。'; client_config "${1:-}" ;;
     uninstall) [[ $# -eq 0 ]] || die 'uninstall 不接受额外参数。'; uninstall_tunnel ;;
     help|-h|--help) usage ;;
-    *) die "未知命令：$command（运行 '$0 help' 查看用法）" ;;
+    *) die "未知命令：${command}（运行 '$0 help' 查看用法）" ;;
   esac
 }
 
