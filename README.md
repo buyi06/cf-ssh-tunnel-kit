@@ -47,16 +47,18 @@ Tunnel 和 DNS 完成后即可直接连接。客户端使用 `cloudflared` 作�
 
 ## 客户端连接
 
-在你的电脑安装 `cloudflared` 后，运行：
+安装完成或重复执行 `install` 时，脚本会直接打印可复制的完整连接信息：`~/.ssh/config` 的 Host 配置块和一条免配置直连命令，用户名默认为安装时的用户。
+
+客户端电脑安装 `cloudflared` 后，也可以随时按需生成：
 
 ```bash
-bash scripts/cf-ssh-tunnel.sh client-config ssh.example.com
+bash scripts/cf-ssh-tunnel.sh client-config ssh.example.com [用户名]
 ```
 
 把输出内容复制到 `~/.ssh/config`，然后连接：
 
 ```bash
-ssh <你的 Linux 用户名>@ssh.example.com
+ssh root@ssh.example.com
 ```
 
 ## 维护命令

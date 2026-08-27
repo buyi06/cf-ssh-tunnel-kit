@@ -34,6 +34,7 @@ PROTOCOL='auto'
 LOGIN_HOME=''
 CERT_FILE=''
 TUNNEL_CREATED=0
+INSTALL_USER=''
 
 say() { printf '%s\n' "$*"; }
 info() { say "[信息] $*"; }
@@ -69,7 +70,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh diagnose
   sudo bash cf-ssh-tunnel.sh update
   sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
-  bash cf-ssh-tunnel.sh client-config [ssh.example.com]
+  bash cf-ssh-tunnel.sh client-config [ssh.example.com] [用户名]
   sudo bash cf-ssh-tunnel.sh uninstall
 
 最简单的安装方式：
@@ -84,7 +85,7 @@ usage() {
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
   update         使用系统包管理器更新 cloudflared。
   github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
-  client-config  输出 SSH 客户端配置；不带域名时自动读取本机配置。
+  client-config  输出可直接使用的 SSH 客户端配置（可选参数：域名、用户名）；不带参数时自动读取本机配置。
   uninstall      仅删除本机服务和凭据；不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。
 
 安全说明：
@@ -612,6 +613,7 @@ TUNNEL_UUID=${TUNNEL_UUID}
 TUNNEL_NAME=${TUNNEL_NAME}
 PUBLIC_HOSTNAME=${PUBLIC_HOSTNAME}
 PROTOCOL=${PROTOCOL}
+INSTALL_USER=${INSTALL_USER}
 EOF
   install -o root -g root -m 0600 "$tmp" "$META_FILE"
   rm -f "$tmp"
@@ -623,12 +625,14 @@ read_metadata() {
   TUNNEL_NAME=''
   PUBLIC_HOSTNAME=''
   PROTOCOL='auto'
+  INSTALL_USER=''
   while IFS='=' read -r key value; do
     case "$key" in
       TUNNEL_UUID) TUNNEL_UUID="$value" ;;
       TUNNEL_NAME) TUNNEL_NAME="$value" ;;
       PUBLIC_HOSTNAME) PUBLIC_HOSTNAME="$value" ;;
       PROTOCOL) PROTOCOL="$value" ;;
+      INSTALL_USER) INSTALL_USER="$value" ;;
     esac
   done <"$META_FILE"
   [[ -n "$TUNNEL_UUID" && -n "$PUBLIC_HOSTNAME" ]]
@@ -696,12 +700,29 @@ wait_for_service() {
   die 'Tunnel 服务启动失败。请执行 diagnose 查看网络和日志。'
 }
 
+print_connection_info() {
+  local user="${1:-root}"
+  say '── SSH 连接信息（可直接复制使用） ──'
+  say
+  say '把以下内容追加到客户端电脑的 ~/.ssh/config（客户端也需安装 cloudflared）：'
+  say
+  say "Host ${PUBLIC_HOSTNAME}"
+  say "    HostName ${PUBLIC_HOSTNAME}"
+  say "    User ${user}"
+  say '    ProxyCommand cloudflared access ssh --hostname %h'
+  say
+  say "随后即可连接：ssh ${user}@${PUBLIC_HOSTNAME}"
+  say
+  say '不想改配置文件时，一条命令直连：'
+  say "ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ${user}@${PUBLIC_HOSTNAME}"
+  say
+  say "认证沿用服务器上 ${user} 原有的 SSH 密钥或密码；要换登录用户，改掉 User 和命令里的 ${user} 即可。"
+}
+
 show_connection_notice() {
   say
   say '第 4 步：Tunnel 已自动配置完成。'
-  say "SSH 域名：${PUBLIC_HOSTNAME}"
-  say "客户端配置命令：bash $0 client-config ${PUBLIC_HOSTNAME}"
-  say '连接仍使用 Linux 原有的 SSH 密钥或密码认证。'
+  print_connection_info "${INSTALL_USER:-root}"
   say
   warn '该 SSH 域名现在可从 Internet 访问。请确认已使用强 SSH 密钥，并禁用不需要的密码或 root 登录。'
   info '为降低风险，授权期间使用的账户级证书已自动删除；运行服务只保留本 Tunnel 的专用凭据。'
@@ -739,11 +760,9 @@ load_existing_install() {
       die "服务启动失败。请执行 '$0 diagnose' 排查网络与服务日志。"
     fi
   fi
+  print_connection_info "${INSTALL_USER:-root}"
   say
-  say "客户端配置命令：bash $0 client-config ${PUBLIC_HOSTNAME}"
-  say "连接命令：ssh <你的 Linux 用户名>@${PUBLIC_HOSTNAME}"
-  say "查看详细状态：sudo bash $0 status"
-  say
+  say "查看详细状态：sudo bash $0 status；按需生成客户端配置：bash $0 client-config ${PUBLIC_HOSTNAME} [用户名]"
   say '如需彻底重来：sudo bash '"$0"' uninstall 后再 install。'
 }
 
@@ -770,6 +789,7 @@ install_tunnel() {
   check_network
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
   ensure_service_user
+  INSTALL_USER="${SUDO_USER:-$(id -un)}"
   if [[ "$PROTOCOL" == 'http2' ]]; then
     show_mainland_notice
     configure_github_proxy
@@ -869,24 +889,26 @@ update_cloudflared() {
 }
 
 client_config() {
-  local hostname="${1:-}"
+  local hostname="${1:-}" user="${2:-}"
   if [[ -z "$hostname" ]] && [[ -r "$META_FILE" ]]; then
     read_metadata || true
     hostname="$PUBLIC_HOSTNAME"
+    [[ -n "$user" ]] || user="${INSTALL_USER:-}"
   fi
   [[ -n "$hostname" ]] || die '请提供 SSH 域名，例如：client-config ssh.example.com'
   hostname="${hostname,,}"
   validate_hostname "$hostname" || die '域名格式无效，例如 ssh.example.com。'
+  [[ -n "$user" ]] || user='root'
   cat <<EOF
 请将以下内容加入 SSH 客户端的 ~/.ssh/config（客户端也需安装 cloudflared）：
 
 Host ${hostname}
     HostName ${hostname}
-    User <你的 Linux 用户名>
+    User ${user}
     ProxyCommand cloudflared access ssh --hostname %h
 
 连接命令：
-  ssh <你的 Linux 用户名>@${hostname}
+  ssh ${user}@${hostname}
 
 首次连接会通过 cloudflared 将流量转入 Tunnel，再使用 Linux 原有的 SSH 密钥或密码认证。
 EOF
@@ -927,7 +949,7 @@ main() {
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
     github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;
-    client-config) [[ $# -le 1 ]] || die 'client-config 最多接受一个域名参数。'; client_config "${1:-}" ;;
+    client-config) [[ $# -le 2 ]] || die 'client-config 最多接受域名和用户名两个参数。'; client_config "${1:-}" "${2:-}" ;;
     uninstall) [[ $# -eq 0 ]] || die 'uninstall 不接受额外参数。'; uninstall_tunnel ;;
     help|-h|--help) usage ;;
     *) die "未知命令：${command}（运行 '$0 help' 查看用法）" ;;
