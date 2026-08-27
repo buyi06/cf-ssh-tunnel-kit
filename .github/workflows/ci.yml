@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Bash 语法检查
+        run: |
+          bash -n scripts/cf-ssh-tunnel.sh
+          bash -n tests/test-cf-ssh-tunnel.sh
+
+      # SC2155：本脚本大量使用 local x="$(cmd)"；在 set -Eeuo pipefail + ERR trap
+      # 的组合下命令替换失败仍会被捕获，此模式的退出码掩码风险可接受，故全局豁免。
+      # SC1090：测试有意 source 变量路径的脚本以做行为测试，无法静态跟随。
+      - name: Shellcheck 静态检查
+        run: shellcheck -S warning --exclude=SC2155,SC1090 scripts/cf-ssh-tunnel.sh tests/test-cf-ssh-tunnel.sh
+
+      - name: 无网络回归测试
+        run: bash tests/test-cf-ssh-tunnel.sh
