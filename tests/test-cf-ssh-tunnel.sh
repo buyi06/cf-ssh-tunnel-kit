@@ -79,6 +79,7 @@ pass '毫秒换算行为正确（.5 -> 500）'
 pass '毫秒换算行为正确（12 -> 12000）'
 
 # 行为测试：同一域名生成确定的 Tunnel 名称
+# shellcheck disable=SC2034  # 由 source 进来的 make_tunnel_name 读取
 PUBLIC_HOSTNAME='ssh.example.com'
 make_tunnel_name
 tunnel_name_first="$TUNNEL_NAME"
