@@ -25,6 +25,8 @@
 
 选中项通过 Git 的 `url.<proxy>https://github.com/.insteadOf` 规则应用到当前管理员账户的 GitHub Git 操作。它不会写入 `HTTP_PROXY`、`HTTPS_PROXY` 或系统软件源配置；因此不会代理 Cloudflare、APT 或无关的系统流量。第三方代理不能充当代码完整性保证，生产使用仍应固定和审核提交或发布版本。
 
+对 Cloudflare 官方 GitHub 发布包 `cloudflared-linux-amd64.deb` 的范围请求探测表明，部分候选项可返回 `206 Partial Content` 和 `application/octet-stream`，说明它们能透传 GitHub Release 二进制下载；另有候选项在探测超时内不可用。该结果只说明传输兼容性，绝不说明代理内容可信。若采用该加速路径，脚本必须先从 GitHub API 的官方 Release 元数据获得 SHA-256，再仅在校验通过后安装；元数据、校验或下载任何一步失败时应回退到 Cloudflare 官方签名软件包仓库。[5] [7]
+
 ## 自动化边界
 
 Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠自动完成。Cloudflare Access 策略涉及用户的身份提供商、允许邮箱或团队组；脚本没有权限也不应猜测这些安全决策。因此脚本将该步骤清楚提示为唯一需要管理员在控制台确认的安全设置，而不是默认将 SSH 暴露给未验证访问者。
@@ -37,3 +39,4 @@ Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠
 [4]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/ "Cloudflare: Connect to SSH with client-side cloudflared"
 [5]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/ "Cloudflare: Downloads"
 [6]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/ "Cloudflare: Tunnel with firewall"
+[7]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/ "Cloudflare: Downloads"

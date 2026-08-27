@@ -100,6 +100,15 @@ assert_contains "$script_text" 'remove_known_github_proxies' '切换代理前清
 assert_contains "$script_text" 'GITHUB_PROXY_STATE_FILE' '记录代理状态'
 assert_not_contains "$script_text" 'export HTTP_PROXY=' '不设置系统 HTTP_PROXY'
 assert_not_contains "$script_text" 'export HTTPS_PROXY=' '不设置系统 HTTPS_PROXY'
+assert_contains "$script_text" "CLOUDFLARED_RELEASE_PAGE='https://github.com/cloudflare/cloudflared/releases/latest'" '使用官方 Release 页面作为校验来源'
+assert_contains "$script_text" 'get_cloudflared_release_metadata()' '包含官方 Release 元数据解析函数'
+assert_contains "$script_text" 'cloudflared-linux-amd64.deb' '限定代理下载的 Debian amd64 资产名称'
+assert_contains "$script_text" "sha256sum \"\$tmp\"" '校验代理下载文件的 SHA-256'
+assert_contains "$script_text" "dpkg-deb -I \"\$tmp\"" '校验下载文件为有效 Debian 包'
+assert_contains "$script_text" "chmod 0644 \"\$tmp\"" '允许 APT 沙箱读取已校验的临时 Debian 包'
+assert_contains "$script_text" "actual_sha\" != \"\$expected_sha" '哈希不一致时拒绝安装'
+assert_contains "$script_text" 'Cloudflare 官方签名软件源' '代理下载失败时回退官方签名软件源'
+assert_contains "$script_text" "\"\$PROTOCOL\" == 'http2'" '仅中国大陆模式尝试代理下载'
 assert_contains "$script_text" "rm -rf \"\$LOGIN_HOME\"" '授权后的账户级证书会被清理'
 
 printf '所有 %d 项无网络回归测试通过。\n' "$pass_count"

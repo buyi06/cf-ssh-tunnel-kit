@@ -23,7 +23,9 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
 
-在 `--mainland` 模式下，脚本还会自动测速 `gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 和 `axisnow.gh-proxy.org`，选择可用且延迟最低者，并为当前管理员账户写入 Git 的 GitHub URL 重写规则。它只影响 Git 的 `https://github.com/` 克隆和拉取，不设置 `HTTP_PROXY` / `HTTPS_PROXY`，不会代理 apt、Cloudflare 授权、Tunnel 或系统其他流量。可随时重新测速或关闭：
+在 `--mainland` 模式下，脚本还会自动测速 `gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 和 `axisnow.gh-proxy.org`，选择可用且延迟最低者，并为当前管理员账户写入 Git 的 GitHub URL 重写规则。它只影响 Git 的 `https://github.com/` 克隆和拉取，不设置 `HTTP_PROXY` / `HTTPS_PROXY`，不会代理 apt、Cloudflare 授权、Tunnel 或系统其他流量。
+
+如果 Debian amd64 主机尚未安装 `cloudflared`，同一次测速还会挑选能够透传 Cloudflare 官方 GitHub Release `.deb` 包的最快代理。脚本先从 GitHub 官方 Release 页面取得版本和 SHA-256，再下载代理文件、校验 SHA-256、校验 Debian 包结构，**全部通过才安装**；任一步失败都会改用 Cloudflare 官方签名 APT 软件源。可随时重新测速或关闭 Git 加速：
 
 ```bash
 sudo bash scripts/cf-ssh-tunnel.sh github-proxy

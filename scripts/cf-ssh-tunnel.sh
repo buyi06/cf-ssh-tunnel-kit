@@ -15,6 +15,7 @@ readonly EDGE_HOST_1='region1.v2.argotunnel.com'
 readonly EDGE_HOST_2='region2.v2.argotunnel.com'
 readonly GITHUB_PREFIX='https://github.com/'
 readonly PROJECT_GIT_INFO_URL='https://github.com/buyi06/cf-ssh-tunnel-kit.git/info/refs?service=git-upload-pack'
+readonly CLOUDFLARED_RELEASE_PAGE='https://github.com/cloudflare/cloudflared/releases/latest'
 readonly GITHUB_PROXY_STATE_FILE='/etc/cf-ssh-tunnel/github-proxy.env'
 readonly -a GITHUB_PROXY_CANDIDATES=(
   'https://gh-proxy.org/'
@@ -154,9 +155,107 @@ show_cloudflared_version() {
   info "已检测到 cloudflared，跳过安装：${output}"
 }
 
+get_cloudflared_release_metadata() {
+  local final_url tag digest tmp
+  tmp="$(mktemp)"
+  if ! final_url="$(curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 \
+    --output "$tmp" --write-out '%{url_effective}' "$CLOUDFLARED_RELEASE_PAGE")"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  tag="${final_url##*/}"
+  digest="$(grep -Eio 'cloudflared-linux-amd64\.deb[^0-9a-f]{0,300}[0-9a-f]{64}' "$tmp" | head -n 1 | grep -Eio '[0-9a-f]{64}' | tr '[:upper:]' '[:lower:]' || true)"
+  rm -f "$tmp"
+  [[ "$tag" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf 'https://github.com/cloudflare/cloudflared/releases/download/%s/cloudflared-linux-amd64.deb\t%s' "$tag" "$digest"
+}
+
+
+probe_cloudflared_release_proxy() {
+  local proxy="$1" asset_url="$2" output code seconds content_type milliseconds
+  output="$(curl --request GET --silent --show-error --location --max-redirs 5 \
+    --connect-timeout 5 --max-time 20 --range 0-1023 --output /dev/null \
+    --write-out '%{http_code}\t%{time_total}\t%{content_type}' \
+    "${proxy}${asset_url}" 2>/dev/null)" || return 1
+  IFS=$'\t' read -r code seconds content_type <<<"$output"
+  [[ "$code" == '200' || "$code" == '206' ]] || return 1
+  [[ "$content_type" == *'application/octet-stream'* ]] || return 1
+  milliseconds="$(seconds_to_milliseconds "$seconds")"
+  printf '%s\t%s' "$proxy" "$milliseconds"
+}
+
+install_cloudflared_deb_via_proxy() {
+  local metadata asset_url expected_sha candidate result proxy latency best_proxy='' best_latency=-1
+  local tmp actual_sha
+  [[ "$PACKAGE_MANAGER" == 'apt' && "$(uname -m)" == 'x86_64' ]] || return 1
+  command -v sha256sum >/dev/null 2>&1 || { warn '未找到 sha256sum，拒绝通过第三方代理下载 cloudflared。'; return 1; }
+  command -v dpkg-deb >/dev/null 2>&1 || { warn '未找到 dpkg-deb，拒绝通过第三方代理下载 cloudflared。'; return 1; }
+
+  metadata="$(get_cloudflared_release_metadata || true)"
+  if [[ -z "$metadata" ]]; then
+    warn '无法从 GitHub 官方 Release 页面获取 cloudflared 的 SHA-256；改用 Cloudflare 官方签名软件源。'
+    return 1
+  fi
+  IFS=$'\t' read -r asset_url expected_sha <<<"$metadata"
+
+  info '正在测试 GitHub 代理对 Cloudflare 官方 cloudflared Debian 包的下载速度。'
+  printf '%-34s %-12s %s\n' '代理地址' '延迟' '结果'
+  for candidate in "${GITHUB_PROXY_CANDIDATES[@]}"; do
+    result="$(probe_cloudflared_release_proxy "$candidate" "$asset_url" || true)"
+    if [[ -z "$result" ]]; then
+      printf '%-34s %-12s %s\n' "$candidate" '-' '不可用或二进制响应异常'
+      continue
+    fi
+    IFS=$'\t' read -r proxy latency <<<"$result"
+    printf '%-34s %-12s %s\n' "$proxy" "${latency} ms" '可用'
+    if (( best_latency < 0 || latency < best_latency )); then
+      best_proxy="$proxy"
+      best_latency="$latency"
+    fi
+  done
+  if [[ -z "$best_proxy" ]]; then
+    warn '没有可用的 GitHub 代理可下载 cloudflared；改用 Cloudflare 官方签名软件源。'
+    return 1
+  fi
+
+  tmp="$(mktemp --suffix=.deb)"
+  if ! curl_secure -o "$tmp" "${best_proxy}${asset_url}"; then
+    rm -f "$tmp"
+    warn '代理下载 cloudflared 失败；改用 Cloudflare 官方签名软件源。'
+    return 1
+  fi
+  actual_sha="$(sha256sum "$tmp" | awk '{print $1}')"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    rm -f "$tmp"
+    warn '代理下载文件的 SHA-256 与 GitHub 官方 Release 元数据不一致，已拒绝安装并回退。'
+    return 1
+  fi
+  if ! dpkg-deb -I "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    warn '已下载文件不是有效 Debian 软件包，已拒绝安装并回退。'
+    return 1
+  fi
+  chmod 0644 "$tmp"
+  info "SHA-256 校验通过；使用 ${best_proxy}（${best_latency} ms）安装 cloudflared。"
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp"; then
+    rm -f "$tmp"
+    warn '通过代理安装 cloudflared 失败；改用 Cloudflare 官方签名软件源。'
+    return 1
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 install_cloudflared() {
   install_prerequisites
   local tmp
+  if [[ "$PROTOCOL" == 'http2' ]] && install_cloudflared_deb_via_proxy; then
+    find_cloudflared || die 'cloudflared 代理安装完成后仍未找到可执行文件。'
+    info "cloudflared 已安装：$($CF_BIN --version 2>&1)"
+    return 0
+  fi
   case "$PACKAGE_MANAGER" in
     apt)
       info '正在配置 Cloudflare 官方 APT 软件源并安装 cloudflared。'
