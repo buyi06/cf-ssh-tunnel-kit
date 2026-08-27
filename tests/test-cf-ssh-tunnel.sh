@@ -42,9 +42,10 @@ assert_contains "$help_output" 'github-proxy [--show|--disable]' '帮助文本�
 assert_contains "$help_output" 'GitHub 代理仅写入 Git 的 github.com 规则' '帮助文本限制代理影响范围'
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
-assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Access ProxyCommand'
+assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Tunnel ProxyCommand'
 assert_contains "$client_output" 'ssh <你的 Linux 用户名>@ssh.example.com' '客户端配置包含连接命令'
-assert_contains "$client_output" '配置 Access Self-hosted 应用' '客户端配置提醒 Access 策略'
+assert_contains "$client_output" 'Linux 原有的 SSH 密钥或密码认证' '客户端配置说明标准 SSH 认证'
+assert_not_contains "$client_output" '配置 Access Self-hosted 应用' '客户端配置不要求 Access 控制台操作'
 
 set +e
 bash "$SCRIPT" unexpected-command >/tmp/cf-ssh-tunnel-test.stderr 2>&1
@@ -72,7 +73,9 @@ pass '未规范化的大写域名被拒绝'
 script_text="$(cat "$SCRIPT")"
 assert_contains "$script_text" 'ensure_cloudflared()' '包含 cloudflared 自动检测函数'
 assert_contains "$script_text" "info '未安装 cloudflared，开始自动安装。'" '未安装时触发自动安装'
-assert_contains "$script_text" 'tunnel login' '包含 Cloudflare 浏览器授权命令'
+assert_contains "$script_text" "\"\$CF_BIN\" tunnel login" '包含 Cloudflare 浏览器授权命令'
+assert_contains "$script_text" 'show_connection_notice' '完成流程直接输出连接提示'
+assert_not_contains "$script_text" 'show_access_notice' '完成流程不要求 Access 控制台步骤'
 assert_contains "$script_text" 'https:// 开头的授权链接' '以中文说明授权链接'
 assert_contains "$script_text" "tunnel --origincert \"\$CERT_FILE\" create \"\$TUNNEL_NAME\"" '使用授权证书自动创建 Tunnel'
 assert_contains "$script_text" "route dns \"\$TUNNEL_UUID\" \"\$PUBLIC_HOSTNAME\"" '自动创建域名 DNS 路由'

@@ -19,7 +19,7 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 | 1. 检查环境 | 无需操作。 | 检查本机 SSH、DNS、Cloudflare TCP/7844；检测 `cloudflared`，未安装时自动安装。 |
 | 2. Cloudflare 授权 | 复制终端显示的 `https://...` 链接，在任意浏览器打开并选择站点。 | 等待授权成功，不需要服务器显示器。 |
 | 3. 填写域名 | 输入完整域名，例如 `ssh.example.com`。 | 创建 Tunnel、自动写 DNS CNAME、生成 `ssh://localhost:22` ingress、校验配置、启动 systemd 服务。 |
-| 4. Access 保护 | 在 Zero Trust 中设置一次仅允许自己的 Access 策略。 | 输出客户端 SSH 配置模板。 |
+| 4. 直接连接 | 无需额外控制台设置。 | 输出客户端 SSH 配置模板；继续使用服务器原有的 SSH 密钥或密码认证。 |
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
 
@@ -36,9 +36,11 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 
 你的域名必须已添加到 Cloudflare，且 DNS 已交由 Cloudflare 托管。服务器上必须已有正在运行的 SSH 服务，通常监听 `22` 端口。Cloudflare 官方的本地管理 Tunnel 支持在授权后使用 CLI 自动创建 Tunnel 和 DNS 路由。[2]
 
-## Access 安全设置
+## 连接与安全边界
 
-Tunnel 和 DNS 可由脚本自动创建，但**不要跳过 Cloudflare Access**。为避免脚本猜测你的邮箱、身份提供商或团队规则，它不会自动开放 SSH。请在 Cloudflare Zero Trust 中创建 Self-hosted 应用，域名填写刚刚设置的 `ssh.example.com`，并仅允许你自己的账号或指定用户组。Cloudflare 官方 SSH 连接方式要求客户端也通过 `cloudflared` 完成 Access 认证。[3]
+Tunnel 和 DNS 完成后即可连接，不需要再配置 Cloudflare Access。客户端使用 `cloudflared` 作为 SSH 的 Tunnel 代理，随后继续由服务器上的 `sshd` 验证 Linux 用户、SSH 密钥或密码。[3]
+
+> 不配置 Cloudflare Access 时，该 SSH 域名会向 Internet 公开可达。[4] 这不等于任何人都能登录，但请优先使用 SSH 密钥认证，并关闭不需要的 root 或密码登录。
 
 ## 客户端连接
 
@@ -81,3 +83,4 @@ ssh <你的 Linux 用户名>@ssh.example.com
 [1]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/ "Cloudflare: Tunnel run parameters"
 [2]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/create-local-tunnel/ "Cloudflare: Create a locally-managed tunnel"
 [3]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/ "Cloudflare: Connect to SSH with client-side cloudflared"
+[4]: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/ "Cloudflare: Publish a self-hosted application to the Internet"

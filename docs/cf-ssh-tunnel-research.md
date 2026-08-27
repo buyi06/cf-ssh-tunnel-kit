@@ -11,13 +11,13 @@
 | 自动 DNS | `cloudflared tunnel route dns <UUID 或名称> <hostname>` 可创建指向 `<UUID>.cfargotunnel.com` 的 CNAME。[1] | 用户只填写完整 SSH 域名；脚本自动创建 DNS 路由。 |
 | SSH ingress | Cloudflare 配置文件支持 `ssh://localhost:22`，且 ingress 规则必须以兜底规则结束。[2] | 自动写入单一 SSH 域名、`ssh://localhost:22` 与 `http_status:404`。 |
 | 账户级证书 | `cert.pem` 可管理账户下 Tunnel；Tunnel JSON 凭据只允许运行特定 Tunnel。[3] | 账户级证书仅存在于临时目录，创建与路由完成后删除；systemd 仅保存专用 JSON。 |
-| Access 身份保护 | Cloudflare SSH 指引推荐 Access 自托管应用，SSH 客户端经 `cloudflared access ssh` 完成身份验证。[4] | 脚本自动化 Tunnel 与 DNS，但不猜测用户身份提供商或访问对象；完成后明确要求管理员创建最小化 Access 策略。 |
+| Access 身份保护 | Cloudflare SSH 指引将 Access 自托管应用列为“推荐”；Cloudflare 说明没有 Access 应用的 Published application 会向 Internet 公开可达。[4] [8] | 按用户要求，脚本不再把 Access 设为必做步骤；仍保留现有 SSH 密钥或密码认证，并将 Access 说明改为可选增强保护。 |
 | Linux 安装 | Cloudflare 为 Debian/Ubuntu 和 RHEL 系提供签名软件源，也提供其他 Linux 安装方式。[5] | 先检测现有 `cloudflared` 并跳过安装；不存在时按发行版自动安装。 |
 | 运行网络 | Tunnel 需要到 Cloudflare 边缘的出站 `7844`；QUIC 使用 UDP，HTTP/2 使用 TCP。[6] | 安装前检查 DNS 与 TCP/7844；`--mainland` 固定 HTTP/2/TCP。 |
 
 ## 中国大陆网络边界
 
-`--mainland` 是兼容性模式，而非规避网络控制的工具。它强制使用基于 TCP/7844 的 HTTP/2，避免依赖 UDP/QUIC；若服务器 DNS、TCP/7844 或客户端 Access 登录网络不可达，Cloudflare Tunnel 无法建立或使用。[6] 脚本会明确报错，不会自动转向未知第三方中继，也不会移除 Access 身份保护。
+`--mainland` 是兼容性模式，而非规避网络控制的工具。它强制使用基于 TCP/7844 的 HTTP/2，避免依赖 UDP/QUIC；若服务器 DNS、TCP/7844 或客户端连接网络不可达，Cloudflare Tunnel 无法建立或使用。[6] 脚本会明确报错，不会自动转向未知第三方中继。
 
 ## GitHub 代理测速边界
 
@@ -25,11 +25,11 @@
 
 选中项通过 Git 的 `url.<proxy>https://github.com/.insteadOf` 规则应用到当前管理员账户的 GitHub Git 操作。它不会写入 `HTTP_PROXY`、`HTTPS_PROXY` 或系统软件源配置；因此不会代理 Cloudflare、APT 或无关的系统流量。第三方代理不能充当代码完整性保证，生产使用仍应固定和审核提交或发布版本。
 
-对 Cloudflare 官方 GitHub 发布包 `cloudflared-linux-amd64.deb` 的范围请求探测表明，部分候选项可返回 `206 Partial Content` 和 `application/octet-stream`，说明它们能透传 GitHub Release 二进制下载；另有候选项在探测超时内不可用。该结果只说明传输兼容性，绝不说明代理内容可信。若采用该加速路径，脚本必须先从 GitHub API 的官方 Release 元数据获得 SHA-256，再仅在校验通过后安装；元数据、校验或下载任何一步失败时应回退到 Cloudflare 官方签名软件包仓库。[5] [7]
+对 Cloudflare 官方 GitHub 发布包 `cloudflared-linux-amd64.deb` 的范围请求探测表明，部分候选项可返回 `206 Partial Content` 和 `application/octet-stream`，说明它们能透传 GitHub Release 二进制下载；另有候选项在探测超时内不可用。该结果只说明传输兼容性，绝不说明代理内容可信。加速路径从 GitHub 官方 Release 页面取得版本和 SHA-256，再仅在校验通过后安装；元数据、校验或下载任何一步失败时回退到 Cloudflare 官方签名软件包仓库。[5] [7]
 
 ## 自动化边界
 
-Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠自动完成。Cloudflare Access 策略涉及用户的身份提供商、允许邮箱或团队组；脚本没有权限也不应猜测这些安全决策。因此脚本将该步骤清楚提示为唯一需要管理员在控制台确认的安全设置，而不是默认将 SSH 暴露给未验证访问者。
+Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠自动完成。按用户选择，Cloudflare Access 不再是部署阻塞条件；SSH 仍应使用强密钥认证并禁用 root 密码登录等常规系统加固方式。由于未创建 Access 应用时该主机名会对 Internet 公开可达，Access 被保留为可选的额外身份保护，而非默认流程。
 
 ## 参考资料
 
@@ -40,3 +40,4 @@ Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠
 [5]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/ "Cloudflare: Downloads"
 [6]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/ "Cloudflare: Tunnel with firewall"
 [7]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/ "Cloudflare: Downloads"
+[8]: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/ "Cloudflare: Publish a self-hosted application to the Internet"

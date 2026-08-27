@@ -86,7 +86,7 @@ usage() {
 
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
-  脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；Cloudflare Access 身份策略仍需由账号管理员确认配置。
+  脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；连接继续使用 Linux 原有的 SSH 密钥或密码认证。
   GitHub 代理仅写入 Git 的 github.com 规则，不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
 EOF
 }
@@ -668,15 +668,14 @@ wait_for_service() {
   die 'Tunnel 服务启动失败。请执行 diagnose 查看网络和日志。'
 }
 
-show_access_notice() {
+show_connection_notice() {
   say
   say '第 4 步：Tunnel 已自动配置完成。'
   say "SSH 域名：${PUBLIC_HOSTNAME}"
+  say "客户端配置命令：bash $0 client-config ${PUBLIC_HOSTNAME}"
+  say '连接仍使用 Linux 原有的 SSH 密钥或密码认证。'
   say
-  warn '为避免任何人访问 SSH，请在 Cloudflare Zero Trust → Access → Applications 中为该域名创建 Self-hosted 应用，并仅允许你的账号或指定用户组。'
-  say '这是身份策略配置，脚本不会猜测你的登录方式，也不会默认开放 SSH。'
-  say "完成后，在客户端运行：bash $0 client-config ${PUBLIC_HOSTNAME}"
-  say
+  warn '该 SSH 域名现在可从 Internet 访问。请确认已使用强 SSH 密钥，并禁用不需要的密码或 root 登录。'
   info '为降低风险，授权期间使用的账户级证书已自动删除；运行服务只保留本 Tunnel 的专用凭据。'
 }
 
@@ -722,7 +721,7 @@ install_tunnel() {
   systemctl daemon-reload
   systemctl enable --now "$SERVICE_NAME"
   wait_for_service
-  show_access_notice
+  show_connection_notice
 }
 
 status_tunnel() {
@@ -821,8 +820,7 @@ Host ${hostname}
 连接命令：
   ssh <你的 Linux 用户名>@${hostname}
 
-首次连接时，cloudflared 会打开浏览器完成 Cloudflare Access 身份验证。
-请先在 Cloudflare Zero Trust 中为 ${hostname} 配置 Access Self-hosted 应用和最小化访问策略。
+首次连接会通过 cloudflared 将流量转入 Tunnel，再使用 Linux 原有的 SSH 密钥或密码认证。
 EOF
 }
 

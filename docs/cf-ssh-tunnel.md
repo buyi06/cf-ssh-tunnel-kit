@@ -11,6 +11,7 @@
 | Tunnel 与 DNS | 自动创建本地管理 Tunnel，并将用户输入的域名 CNAME 到 `<UUID>.cfargotunnel.com`。[1] |
 | SSH 服务路由 | 自动生成 `ssh://localhost:22` ingress 和最后的 `http_status:404` 兜底规则。[2] |
 | 开机运行 | 创建受限 systemd 服务，失败自动重启，服务进程仅可读取该 Tunnel 专用 JSON 凭据。 |
+| SSH 认证 | 不需要额外 Access 控制台配置；继续使用服务器原有的 SSH 密钥或密码认证。 |
 | 中国大陆网络 | `--mainland` 强制 HTTP/2（TCP/7844），不依赖 UDP/QUIC；不能承诺任意网络均可用。 |
 
 ## 开始前只需确认两件事
@@ -41,16 +42,11 @@ ssh.example.com
 
 > 授权期间产生的 `cert.pem` 具有账户级 Tunnel 管理能力。脚本仅在自动创建和 DNS 配置的短暂期间使用它，完成后立即清理；运行服务只保留此 Tunnel 的专用 JSON 凭据。[3]
 
-## 最后一次安全配置：Cloudflare Access
+## 连接与安全边界
 
-Tunnel 与 DNS 可以自动配置，但脚本不会擅自猜测你的身份提供商、邮箱或团队成员，从而不安全地创建访问策略。请在 Cloudflare Zero Trust 控制台完成一次最小化 Access 策略：
+Tunnel、DNS 和 SSH 路由在输入域名后即已完成，不需要再进行 Cloudflare Access 控制台操作。客户端仍需要安装 `cloudflared` 作为 SSH 的 Tunnel 代理，随后以服务器现有的 Linux SSH 密钥或密码完成认证。[5]
 
-1. 进入 **Access → Applications → Add an application → Self-hosted**。
-2. 填写刚才设置的 SSH 域名，例如 `ssh.example.com`。
-3. 创建一条策略，只允许你自己的邮箱、身份组或明确的成员。
-4. 保存后再进行 SSH 连接。
-
-Cloudflare 的官方 SSH 模式要求在客户端也使用 `cloudflared`，并通过 Access 认证后再建立 SSH 代理连接。[5]
+> 未创建 Cloudflare Access 应用时，该 SSH 域名会向 Internet 公开可达。[6] 这不等于免认证登录：`sshd` 仍会验证你的 Linux SSH 密钥或密码。请优先使用密钥认证，禁用不需要的 root 或密码登录，并保持系统更新。
 
 ## 中国大陆 GitHub 加速
 
@@ -82,7 +78,7 @@ bash scripts/cf-ssh-tunnel.sh client-config ssh.example.com
 ssh <你的 Linux 用户名>@ssh.example.com
 ```
 
-首次连接会打开浏览器完成 Cloudflare Access 登录；随后仍会进行正常的 Linux SSH 主机密钥与用户凭据校验。[5]
+连接会通过 cloudflared 转入 Tunnel，随后仍会进行正常的 Linux SSH 主机密钥与用户凭据校验。[5]
 
 ## 常用维护命令
 
@@ -102,9 +98,9 @@ ssh <你的 Linux 用户名>@ssh.example.com
 
 **自动 DNS 失败。** 该域名必须已添加到 Cloudflare，DNS 必须由 Cloudflare 托管；授权时也必须选择了包含此域名的站点。[1]
 
-**中国大陆服务器连不上。** 请使用 `--mainland`。该模式使用 TCP/7844 的 HTTP/2；若 TCP/7844、DNS 或 Access 登录仍不可达，则 Cloudflare Tunnel 无法使用。脚本不会提供绕过网络控制的方案。[4]
+**中国大陆服务器连不上。** 请使用 `--mainland`。该模式使用 TCP/7844 的 HTTP/2；若 TCP/7844、DNS 或客户端连接网络不可达，则 Cloudflare Tunnel 无法使用。脚本不会提供绕过网络控制的方案。[4]
 
-**SSH 仍然连接失败。** 先运行 `diagnose`，确认 systemd 服务是 `active`。然后确认已为 SSH 域名创建 Cloudflare Access Self-hosted 应用和最小化策略，且客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`。[5]
+**SSH 仍然连接失败。** 先运行 `diagnose`，确认 systemd 服务是 `active`，再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
 
 ## 参考资料
 
@@ -113,3 +109,4 @@ ssh <你的 Linux 用户名>@ssh.example.com
 [3]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/tunnel-permissions/ "Cloudflare: Tunnel permissions"
 [4]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/ "Cloudflare: Tunnel with firewall"
 [5]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/use-cases/ssh/ssh-cloudflared-authentication/ "Cloudflare: Connect to SSH with client-side cloudflared"
+[6]: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/ "Cloudflare: Publish a self-hosted application to the Internet"
