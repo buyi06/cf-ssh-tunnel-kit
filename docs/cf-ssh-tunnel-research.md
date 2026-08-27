@@ -19,6 +19,12 @@
 
 `--mainland` 是兼容性模式，而非规避网络控制的工具。它强制使用基于 TCP/7844 的 HTTP/2，避免依赖 UDP/QUIC；若服务器 DNS、TCP/7844 或客户端 Access 登录网络不可达，Cloudflare Tunnel 无法建立或使用。[6] 脚本会明确报错，不会自动转向未知第三方中继，也不会移除 Access 身份保护。
 
+## GitHub 代理测速边界
+
+大陆网络优化候选项由用户指定为 `gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 与 `axisnow.gh-proxy.org`。脚本不以首页能否打开作为有效性判断，而是对本项目 Git 智能 HTTP 的 `info/refs?service=git-upload-pack` 端点发起只读 GET 探测。只有 HTTP `200` 且响应类型为 `application/x-git-upload-pack-advertisement` 的候选项才参与延迟排序；探测结果仅代表执行时该主机的网络条件，不能预设长期最快项。
+
+选中项通过 Git 的 `url.<proxy>https://github.com/.insteadOf` 规则应用到当前管理员账户的 GitHub Git 操作。它不会写入 `HTTP_PROXY`、`HTTPS_PROXY` 或系统软件源配置；因此不会代理 Cloudflare、APT 或无关的系统流量。第三方代理不能充当代码完整性保证，生产使用仍应固定和审核提交或发布版本。
+
 ## 自动化边界
 
 Tunnel、DNS CNAME、SSH ingress、专用凭据和本机服务可由脚本可靠自动完成。Cloudflare Access 策略涉及用户的身份提供商、允许邮箱或团队组；脚本没有权限也不应猜测这些安全决策。因此脚本将该步骤清楚提示为唯一需要管理员在控制台确认的安全设置，而不是默认将 SSH 暴露给未验证访问者。

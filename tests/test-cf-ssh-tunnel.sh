@@ -38,6 +38,8 @@ assert_contains "$help_output" 'install [--mainland|--auto|--quic]' '帮助文�
 assert_contains "$help_output" '输出浏览器授权链接' '帮助文本说明浏览器授权'
 assert_contains "$help_output" '自动创建 Tunnel、DNS 路由、SSH 配置和系统服务' '帮助文本说明自动配置范围'
 assert_contains "$help_output" '本脚本不会开放服务器入站端口' '帮助文本声明安全边界'
+assert_contains "$help_output" 'github-proxy [--show|--disable]' '帮助文本包含 GitHub 代理管理命令'
+assert_contains "$help_output" 'GitHub 代理仅写入 Git 的 github.com 规则' '帮助文本限制代理影响范围'
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
 assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Access ProxyCommand'
@@ -84,6 +86,20 @@ assert_contains "$script_text" 'NoNewPrivileges=true' 'systemd 禁止新增权�
 assert_contains "$script_text" 'ProtectSystem=full' 'systemd 启用系统文件保护'
 assert_contains "$script_text" 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' 'systemd 限制地址族'
 assert_contains "$script_text" "--mainland) PROTOCOL='http2'" '中国大陆模式固定 HTTP/2'
+assert_contains "$script_text" 'configure_github_proxy' '中国大陆模式调用 GitHub 代理测速'
+assert_contains "$script_text" "readonly -a GITHUB_PROXY_CANDIDATES=(" '定义候选 GitHub 代理列表'
+assert_contains "$script_text" "'https://gh-proxy.org/'" '包含 gh-proxy 候选项'
+assert_contains "$script_text" "'https://v4.gh-proxy.org/'" '包含 v4 候选项'
+assert_contains "$script_text" "'https://v6.gh-proxy.org/'" '包含 v6 候选项'
+assert_contains "$script_text" "'https://cdn.gh-proxy.org/'" '包含 cdn 候选项'
+assert_contains "$script_text" "'https://axisnow.gh-proxy.org/'" '包含 axisnow 候选项'
+assert_contains "$script_text" 'application/x-git-upload-pack-advertisement' '验证 Git 协议响应类型'
+assert_contains "$script_text" 'latency < best_latency' '按低延迟选择代理'
+assert_contains "$script_text" "git config --global \"url.\${best_proxy}\${GITHUB_PREFIX}.insteadOf\"" '通过 Git URL 重写全局加速 GitHub'
+assert_contains "$script_text" 'remove_known_github_proxies' '切换代理前清理旧规则'
+assert_contains "$script_text" 'GITHUB_PROXY_STATE_FILE' '记录代理状态'
+assert_not_contains "$script_text" 'export HTTP_PROXY=' '不设置系统 HTTP_PROXY'
+assert_not_contains "$script_text" 'export HTTPS_PROXY=' '不设置系统 HTTPS_PROXY'
 assert_contains "$script_text" "rm -rf \"\$LOGIN_HOME\"" '授权后的账户级证书会被清理'
 
 printf '所有 %d 项无网络回归测试通过。\n' "$pass_count"

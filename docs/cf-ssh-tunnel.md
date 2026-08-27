@@ -52,6 +52,20 @@ Tunnel 与 DNS 可以自动配置，但脚本不会擅自猜测你的身份提�
 
 Cloudflare 的官方 SSH 模式要求在客户端也使用 `cloudflared`，并通过 Access 认证后再建立 SSH 代理连接。[5]
 
+## 中国大陆 GitHub 加速
+
+当使用 `install --mainland` 时，脚本会自动对以下 GitHub 代理进行 Git 协议测速：`gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 与 `axisnow.gh-proxy.org`。只有返回正确 Git `upload-pack` 响应的代理才会参与比较，脚本将选择总耗时最低的可用项。
+
+选中后，脚本通过 Git 全局 `url.<代理>https://github.com/.insteadOf` 规则加速当前管理员账户访问 `https://github.com/` 的 Git 克隆与拉取。它**不会**设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会代理 apt 更新、Cloudflare 授权、Tunnel 连接或系统其他网络流量。代理速度会随时间和线路变化，可随时重新测速：
+
+```bash
+sudo bash scripts/cf-ssh-tunnel.sh github-proxy
+sudo bash scripts/cf-ssh-tunnel.sh github-proxy --show
+sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
+```
+
+> 这些是第三方 GitHub 加速服务。脚本只验证 Git 协议响应与延迟，不能把第三方代理变成代码来源信任锚。生产环境应固定经过审核的提交或发布版本，并审阅脚本后再以 root 执行。
+
 ## 客户端连接
 
 在你的电脑上安装 `cloudflared` 后，运行：

@@ -13,6 +13,16 @@ readonly META_FILE="${SERVICE_DIR}/tunnel.env"
 readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly EDGE_HOST_1='region1.v2.argotunnel.com'
 readonly EDGE_HOST_2='region2.v2.argotunnel.com'
+readonly GITHUB_PREFIX='https://github.com/'
+readonly PROJECT_GIT_INFO_URL='https://github.com/buyi06/cf-ssh-tunnel-kit.git/info/refs?service=git-upload-pack'
+readonly GITHUB_PROXY_STATE_FILE='/etc/cf-ssh-tunnel/github-proxy.env'
+readonly -a GITHUB_PROXY_CANDIDATES=(
+  'https://gh-proxy.org/'
+  'https://v4.gh-proxy.org/'
+  'https://v6.gh-proxy.org/'
+  'https://cdn.gh-proxy.org/'
+  'https://axisnow.gh-proxy.org/'
+)
 
 CF_BIN=''
 PACKAGE_MANAGER=''
@@ -54,6 +64,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh status
   sudo bash cf-ssh-tunnel.sh diagnose
   sudo bash cf-ssh-tunnel.sh update
+  sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
   bash cf-ssh-tunnel.sh client-config [ssh.example.com]
   sudo bash cf-ssh-tunnel.sh uninstall
 
@@ -68,12 +79,14 @@ usage() {
   status         显示 Tunnel 名称、域名、服务状态和本机 SSH 状态。
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
   update         使用系统包管理器更新 cloudflared。
+  github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
   client-config  输出 SSH 客户端配置；不带域名时自动读取本机配置。
   uninstall      仅删除本机服务和凭据；不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。
 
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
   脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；Cloudflare Access 身份策略仍需由账号管理员确认配置。
+  GitHub 代理仅写入 Git 的 github.com 规则，不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
 EOF
 }
 
@@ -181,6 +194,122 @@ ensure_cloudflared() {
     info '未安装 cloudflared，开始自动安装。'
     install_cloudflared
   fi
+}
+
+ensure_git() {
+  command -v git >/dev/null 2>&1 && return 0
+  info '未安装 Git，正在安装以启用 GitHub 加速。'
+  detect_package_manager
+  case "$PACKAGE_MANAGER" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git ;;
+    dnf) dnf -y install git ;;
+    yum) yum -y install git ;;
+    pacman) pacman -Syu --needed --noconfirm git ;;
+    apk) apk add --no-cache git ;;
+  esac
+  command -v git >/dev/null 2>&1 || die 'Git 安装失败，无法配置 GitHub 代理。'
+}
+
+seconds_to_milliseconds() {
+  local seconds="$1" whole fraction
+  whole="${seconds%%.*}"
+  fraction='0'
+  [[ "$seconds" == *.* ]] && fraction="${seconds#*.}"
+  fraction="${fraction}000"
+  fraction="${fraction:0:3}"
+  printf '%d' "$((10#${whole:-0} * 1000 + 10#${fraction:-0}))"
+}
+
+probe_github_proxy() {
+  local proxy="$1" output code seconds content_type milliseconds
+  output="$(curl --request GET --silent --show-error --location --max-redirs 3 \
+    --connect-timeout 5 --max-time 12 --range 0-1023 --output /dev/null \
+    --write-out '%{http_code}\t%{time_total}\t%{content_type}' \
+    "${proxy}${PROJECT_GIT_INFO_URL}" 2>/dev/null)" || return 1
+  IFS=$'\t' read -r code seconds content_type <<<"$output"
+  [[ "$code" == '200' && "$content_type" == *'application/x-git-upload-pack-advertisement'* ]] || return 1
+  milliseconds="$(seconds_to_milliseconds "$seconds")"
+  printf '%s\t%s' "$proxy" "$milliseconds"
+}
+
+remove_known_github_proxies() {
+  local proxy key
+  for proxy in "${GITHUB_PROXY_CANDIDATES[@]}"; do
+    key="url.${proxy}${GITHUB_PREFIX}.insteadOf"
+    git config --global --unset-all "$key" >/dev/null 2>&1 || true
+  done
+}
+
+write_github_proxy_state() {
+  local proxy="$1" latency="$2" tmp
+  install -d -o root -g root -m 0750 "$SERVICE_DIR"
+  tmp="$(mktemp "${SERVICE_DIR}/.github-proxy.env.XXXXXX")"
+  cat >"$tmp" <<EOF
+GITHUB_PROXY=${proxy}
+LATENCY_MS=${latency}
+CONFIGURED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+  install -o root -g root -m 0600 "$tmp" "$GITHUB_PROXY_STATE_FILE"
+  rm -f "$tmp"
+}
+
+show_github_proxy() {
+  if [[ -r "$GITHUB_PROXY_STATE_FILE" ]]; then
+    say 'GitHub 加速状态：'
+    sed 's/^/[信息] /' "$GITHUB_PROXY_STATE_FILE"
+    say '仅 Git 的 https://github.com/ 地址会使用该代理；系统更新和 Cloudflare 流量不受影响。'
+  else
+    warn '未发现本脚本配置的 GitHub 代理。'
+  fi
+}
+
+disable_github_proxy() {
+  ensure_git
+  remove_known_github_proxies
+  rm -f "$GITHUB_PROXY_STATE_FILE"
+  info '已移除本脚本添加的 GitHub 代理规则。'
+}
+
+configure_github_proxy() {
+  ensure_git
+  local candidate result proxy latency best_proxy='' best_latency=-1
+  say
+  info '正在测试 5 个 GitHub 加速代理，选择 Git 克隆延迟最低的可用项。'
+  say '代理仅用于 Git 的 github.com 地址；不会设置 HTTP_PROXY、HTTPS_PROXY 或影响 Cloudflare Tunnel。'
+  printf '%-34s %-12s %s\n' '代理地址' '延迟' '结果'
+  for candidate in "${GITHUB_PROXY_CANDIDATES[@]}"; do
+    result="$(probe_github_proxy "$candidate" || true)"
+    if [[ -z "$result" ]]; then
+      printf '%-34s %-12s %s\n' "$candidate" '-' '不可用或协议响应异常'
+      continue
+    fi
+    IFS=$'\t' read -r proxy latency <<<"$result"
+    printf '%-34s %-12s %s\n' "$proxy" "${latency} ms" '可用'
+    if (( best_latency < 0 || latency < best_latency )); then
+      best_proxy="$proxy"
+      best_latency="$latency"
+    fi
+  done
+
+  if [[ -z "$best_proxy" ]]; then
+    warn '所有候选 GitHub 代理均不可用；保持 GitHub 直连，不影响 Tunnel 安装。'
+    return 0
+  fi
+
+  remove_known_github_proxies
+  git config --global "url.${best_proxy}${GITHUB_PREFIX}.insteadOf" "$GITHUB_PREFIX"
+  write_github_proxy_state "$best_proxy" "$best_latency"
+  info "已选择 ${best_proxy}（${best_latency} ms），并为当前管理员账户的 GitHub Git 操作启用加速。"
+}
+
+manage_github_proxy() {
+  require_root
+  case "${1:-}" in
+    '') configure_github_proxy ;;
+    --show) show_github_proxy ;;
+    --disable) disable_github_proxy ;;
+    *) die 'github-proxy 仅支持 --show 或 --disable。' ;;
+  esac
 }
 
 ensure_service_user() {
@@ -479,7 +608,10 @@ install_tunnel() {
   check_network
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
   ensure_service_user
-  [[ "$PROTOCOL" == 'http2' ]] && show_mainland_notice
+  if [[ "$PROTOCOL" == 'http2' ]]; then
+    show_mainland_notice
+    configure_github_proxy
+  fi
 
   login_to_cloudflare
   read_hostname
@@ -627,6 +759,7 @@ main() {
     status) [[ $# -eq 0 ]] || die 'status 不接受额外参数。'; status_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
+    github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;
     client-config) [[ $# -le 1 ]] || die 'client-config 最多接受一个域名参数。'; client_config "${1:-}" ;;
     uninstall) [[ $# -eq 0 ]] || die 'uninstall 不接受额外参数。'; uninstall_tunnel ;;
     help|-h|--help) usage ;;

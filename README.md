@@ -23,6 +23,13 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
 
+在 `--mainland` 模式下，脚本还会自动测速 `gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 和 `axisnow.gh-proxy.org`，选择可用且延迟最低者，并为当前管理员账户写入 Git 的 GitHub URL 重写规则。它只影响 Git 的 `https://github.com/` 克隆和拉取，不设置 `HTTP_PROXY` / `HTTPS_PROXY`，不会代理 apt、Cloudflare 授权、Tunnel 或系统其他流量。可随时重新测速或关闭：
+
+```bash
+sudo bash scripts/cf-ssh-tunnel.sh github-proxy
+sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
+```
+
 ## 必要前提
 
 你的域名必须已添加到 Cloudflare，且 DNS 已交由 Cloudflare 托管。服务器上必须已有正在运行的 SSH 服务，通常监听 `22` 端口。Cloudflare 官方的本地管理 Tunnel 支持在授权后使用 CLI 自动创建 Tunnel 和 DNS 路由。[2]
