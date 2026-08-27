@@ -25,10 +25,13 @@
 在服务器上克隆项目并运行一条命令。中国大陆网络或已知 UDP 不稳定时优先用 `--mainland`：
 
 ```bash
-git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git
+git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git 2>/dev/null || true
 cd cf-ssh-tunnel-kit
+git pull --ff-only
 sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 ```
+
+> 这段命令可以重复执行：目录已存在时跳过克隆，`git pull` 更新到最新版；`install` 检测到本机已配置过时直接加载现有状态，不会重复安装。
 
 脚本会全程显示中文提示。若系统尚未安装 `cloudflared`，会自动安装；若已安装则显示版本并跳过。随后终端会出现 Cloudflare 提供的 `https://...` 授权链接。复制它并在任意可联网设备的浏览器中打开，登录 Cloudflare，并选择目标域名所在站点。不要关闭服务器终端；浏览器授权完成后，脚本会自动继续。
 
@@ -99,6 +102,8 @@ ssh <你的 Linux 用户名>@ssh.example.com
 **自动 DNS 失败。** 该域名必须已添加到 Cloudflare，DNS 必须由 Cloudflare 托管；授权时也必须选择了包含此域名的站点。[1]
 
 **中国大陆服务器连不上。** 请使用 `--mainland`。该模式使用 TCP/7844 的 HTTP/2；若 TCP/7844、DNS 或客户端连接网络不可达，则 Cloudflare Tunnel 无法使用。脚本不会提供绕过网络控制的方案。[4]
+
+**重复执行 install 会怎样？** 不会重复安装。脚本检测到已有配置时直接加载，显示现有 Tunnel 的域名、UUID、服务状态与连接命令；服务未运行会自动尝试拉起。想彻底重来，先执行 `uninstall`。
 
 **SSH 仍然连接失败。** 先运行 `diagnose`，确认 systemd 服务是 `active`，再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
 
