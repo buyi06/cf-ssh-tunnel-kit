@@ -7,10 +7,13 @@
 ## 一条命令开始
 
 ```bash
-git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git
+git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git 2>/dev/null || true
 cd cf-ssh-tunnel-kit
+git pull --ff-only
 sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 ```
+
+> 这四行可以整段重复粘贴执行：目录已存在时跳过克隆，`git pull` 更新到最新版，`install` 检测到本机已配置过时直接显示现有 Tunnel 状态和连接命令，**不会重复安装**。
 
 执行后，脚本会按中文提示完成以下流程：
 

@@ -76,7 +76,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh install --mainland
 
 命令说明：
-  install        自动检测/安装 cloudflared，输出浏览器授权链接，随后询问域名并自动创建 Tunnel、DNS 路由、SSH 配置和系统服务。
+  install        首次运行：自动安装 cloudflared、输出浏览器授权链接并创建 Tunnel、DNS 路由、SSH 配置和系统服务。本机已配置过时直接加载现有状态与连接方式，不会重复安装。
   --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络。
   --auto         先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2（默认）。
   --quic         固定使用 QUIC（UDP/7844）。
@@ -714,6 +714,39 @@ show_mainland_notice() {
   say
 }
 
+load_existing_install() {
+  if [[ ! -e "$UNIT_FILE" ]]; then
+    die "检测到残留配置但缺少 systemd 服务文件（可能是上次未完成的安装）。请执行 'sudo bash $0 uninstall' 清理后重新 install。"
+  fi
+  if ! read_metadata; then
+    die "检测到已有配置但无法读取 ${META_FILE}。请执行 'sudo bash $0 uninstall' 清理后重新 install。"
+  fi
+  say
+  say '本机已配置过 cf-ssh-tunnel，直接加载现有安装：'
+  say "Tunnel 名称：${TUNNEL_NAME:-未知}"
+  say "Tunnel UUID：${TUNNEL_UUID}"
+  say "SSH 域名：${PUBLIC_HOSTNAME}"
+  say "传输协议：${PROTOCOL}"
+  say
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    info 'Tunnel 服务正在运行，无需重新安装。'
+  else
+    warn 'Tunnel 服务未在运行，正在尝试启动……'
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+      info '服务已重新启动，运行正常。'
+    else
+      die "服务启动失败。请执行 '$0 diagnose' 排查网络与服务日志。"
+    fi
+  fi
+  say
+  say "客户端配置命令：bash $0 client-config ${PUBLIC_HOSTNAME}"
+  say "连接命令：ssh <你的 Linux 用户名>@${PUBLIC_HOSTNAME}"
+  say "查看详细状态：sudo bash $0 status"
+  say
+  say '如需彻底重来：sudo bash '"$0"' uninstall 后再 install。'
+}
+
 install_tunnel() {
   PROTOCOL='auto'
   while [[ $# -gt 0 ]]; do
@@ -729,7 +762,10 @@ install_tunnel() {
 
   require_root
   require_systemd
-  [[ ! -e "$UNIT_FILE" && ! -e "$META_FILE" && ! -e "$SERVICE_DIR" ]] || die "已存在 ${SERVICE_NAME} 配置或残留文件（可能是上次未完成的安装）。请先执行 'sudo bash $0 uninstall' 清理后重试。"
+  if [[ -e "$UNIT_FILE" || -e "$META_FILE" || -e "$SERVICE_DIR" ]]; then
+    load_existing_install
+    return 0
+  fi
   ensure_cloudflared
   check_network
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
