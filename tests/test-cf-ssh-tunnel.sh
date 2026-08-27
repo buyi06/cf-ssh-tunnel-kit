@@ -43,7 +43,8 @@ assert_contains "$help_output" 'GitHub 代理仅影响 Git 的 github.com 克隆
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
 assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Tunnel ProxyCommand'
-assert_contains "$client_output" 'ssh <你的 Linux 用户名>@ssh.example.com' '客户端配置包含连接命令'
+assert_contains "$client_output" 'User root' '客户端配置默认填充用户名'
+assert_contains "$client_output" 'ssh root@ssh.example.com' '客户端配置包含可直接执行的连接命令'
 assert_contains "$client_output" 'Linux 原有的 SSH 密钥或密码认证' '客户端配置说明标准 SSH 认证'
 assert_not_contains "$client_output" 'Access' '客户端配置不涉及 Access'
 
@@ -153,6 +154,9 @@ assert_contains "$script_text" '--edge-ip-version ${edge_ip_version}' '按协议
 assert_contains "$script_text" 'already[[:space:]]exists' '同名 Tunnel 冲突有针对性提示'
 assert_contains "$script_text" 'load_existing_install' '重复 install 自动加载现有配置'
 assert_contains "$script_text" '-e "$META_FILE" || -e "$SERVICE_DIR" ]]' '完整检测三类已有配置'
+assert_contains "$script_text" 'print_connection_info' '安装完成与加载时直接输出连接信息'
+assert_contains "$script_text" 'INSTALL_USER' '记录安装用户供连接信息使用'
+assert_contains "$script_text" "ssh -o ProxyCommand='cloudflared access ssh --hostname %h'" '提供免配置一条命令直连'
 assert_contains "$script_text" "trap 'cleanup_login_certificate; exit 130' INT" 'Ctrl-C 中断也清理授权证书'
 assert_contains "$script_text" "\"\$PROTOCOL\" == 'http2'" '仅中国大陆模式尝试代理下载'
 assert_contains "$script_text" "rm -rf \"\$LOGIN_HOME\"" '授权后的账户级证书会被清理'

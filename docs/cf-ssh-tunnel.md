@@ -69,16 +69,18 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 
 ## 客户端连接
 
-在你的电脑上安装 `cloudflared` 后，运行：
+安装完成或重复执行 `install` 时，脚本会直接打印完整的连接信息：可直接追加到 `~/.ssh/config` 的 Host 配置块，以及一条免配置直连命令，用户名默认为安装时的用户。
+
+在你的电脑上安装 `cloudflared` 后，也可以随时按需生成：
 
 ```bash
-bash scripts/cf-ssh-tunnel.sh client-config ssh.example.com
+bash scripts/cf-ssh-tunnel.sh client-config ssh.example.com [用户名]
 ```
 
 将输出内容放进客户端的 `~/.ssh/config`，再执行：
 
 ```bash
-ssh <你的 Linux 用户名>@ssh.example.com
+ssh root@ssh.example.com
 ```
 
 连接会通过 cloudflared 转入 Tunnel，随后仍会进行正常的 Linux SSH 主机密钥与用户凭据校验。[5]
