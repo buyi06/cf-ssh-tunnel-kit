@@ -57,6 +57,9 @@ cleanup_login_certificate() {
   fi
 }
 trap cleanup_login_certificate EXIT
+trap 'cleanup_login_certificate; exit 129' HUP
+trap 'cleanup_login_certificate; exit 130' INT
+trap 'cleanup_login_certificate; exit 143' TERM
 
 usage() {
   cat <<'EOF'
@@ -87,7 +90,7 @@ usage() {
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
   脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；连接继续使用 Linux 原有的 SSH 密钥或密码认证。
-  GitHub 代理仅写入 Git 的 github.com 规则，不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
+  GitHub 代理仅影响 Git 的 github.com 克隆与拉取（git push 仍直连 GitHub），不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
 EOF
 }
 
@@ -221,7 +224,8 @@ install_cloudflared_deb_via_proxy() {
   fi
 
   tmp="$(mktemp --suffix=.deb)"
-  if ! curl_secure -o "$tmp" "${best_proxy}${asset_url}"; then
+  # 首 1KB 探测只反映握手延迟，不反映吞吐；deb 约 30MB，放宽下载时限避免慢代理被误判失败。
+  if ! curl_secure --max-time 600 -o "$tmp" "${best_proxy}${asset_url}"; then
     rm -f "$tmp"
     warn '代理下载 cloudflared 失败；改用 Cloudflare 官方签名软件源。'
     return 1
@@ -332,10 +336,18 @@ probe_github_proxy() {
 }
 
 remove_known_github_proxies() {
-  local proxy key
+  local proxy key value
   for proxy in "${GITHUB_PROXY_CANDIDATES[@]}"; do
     key="url.${proxy}${GITHUB_PREFIX}.insteadOf"
     git config --global --unset-all "$key" >/dev/null 2>&1 || true
+  done
+  # pushInsteadOf 的键名固定；仅当当前值确属本脚本写入的已知代理时才删除，避免误删用户自定义规则。
+  value="$(git config --global --get "url.${GITHUB_PREFIX}.pushInsteadOf" 2>/dev/null || true)"
+  for proxy in "${GITHUB_PROXY_CANDIDATES[@]}"; do
+    if [[ "$value" == "${proxy}${GITHUB_PREFIX}" ]]; then
+      git config --global --unset-all "url.${GITHUB_PREFIX}.pushInsteadOf" >/dev/null 2>&1 || true
+      break
+    fi
   done
 }
 
@@ -397,8 +409,10 @@ configure_github_proxy() {
 
   remove_known_github_proxies
   git config --global "url.${best_proxy}${GITHUB_PREFIX}.insteadOf" "$GITHUB_PREFIX"
+  # insteadOf 会同时劫持 push，而加速代理只支持下载；pushInsteadOf 把推送改回直连 GitHub。
+  git config --global "url.${GITHUB_PREFIX}.pushInsteadOf" "${best_proxy}${GITHUB_PREFIX}"
   write_github_proxy_state "$best_proxy" "$best_latency"
-  info "已选择 ${best_proxy}（${best_latency} ms），并为当前管理员账户的 GitHub Git 操作启用加速。"
+  info "已选择 ${best_proxy}（${best_latency} ms）：克隆与拉取经代理加速，git push 仍直连 GitHub。"
 }
 
 manage_github_proxy() {
@@ -459,7 +473,14 @@ check_network() {
       warn "TCP/7844 不通：${host}"
     fi
   done
-  (( tcp_ok == 1 )) || die '无法连接 Cloudflare TCP/7844；请检查防火墙、出口策略或所在网络限制。'
+  if (( tcp_ok == 1 )); then
+    return 0
+  fi
+  if [[ "$PROTOCOL" == 'http2' ]]; then
+    die '无法连接 Cloudflare TCP/7844；--mainland 模式依赖 TCP 出站，请检查防火墙、出口策略或所在网络限制。'
+  fi
+  # QUIC 模式走 UDP/7844，TCP 不通不应直接判死；交给 cloudflared 自行尝试。
+  warn 'TCP/7844 不通，将改用 QUIC（UDP/7844）尝试连接；若 UDP 同样受限，Tunnel 将无法建立。'
 }
 
 check_local_ssh() {
@@ -533,6 +554,9 @@ create_tunnel() {
   info "第 2 步：正在创建 Tunnel（名称：${TUNNEL_NAME}）。"
   if ! output="$(HOME="$LOGIN_HOME" "$CF_BIN" tunnel --origincert "$CERT_FILE" create "$TUNNEL_NAME" 2>&1)"; then
     error "$output"
+    if [[ "$output" =~ already[[:space:]]exists ]]; then
+      die "已存在同名 Tunnel：${TUNNEL_NAME}（通常是上次未完成的安装残留）。请执行 '$0 uninstall'，并到 Cloudflare Zero Trust 控制台（Networks → Tunnels）删除旧 Tunnel 后重试。"
+    fi
     die '创建 Tunnel 失败。请确认授权账号对该 Cloudflare 账户具有 Tunnel 管理权限。'
   fi
   if [[ "$output" =~ ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}) ]]; then
@@ -611,8 +635,12 @@ read_metadata() {
 }
 
 write_unit() {
-  local tmp
+  local tmp edge_ip_version='auto'
   case "$PROTOCOL" in auto|http2|quic) ;; *) die "无效协议：${PROTOCOL}" ;; esac
+  # 大陆网络的 IPv6 出口常见半残（解析得到 v6 却连不通），HTTP/2 模式固定走 IPv4 边缘更稳。
+  if [[ "$PROTOCOL" == 'http2' ]]; then
+    edge_ip_version='4'
+  fi
   tmp="$(mktemp)"
   cat >"$tmp" <<EOF
 [Unit]
@@ -628,7 +656,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${SERVICE_DIR}
-ExecStart=${CF_BIN} tunnel --no-autoupdate --config ${CONFIG_FILE} --protocol ${PROTOCOL} --edge-ip-version auto --retries 5 run ${TUNNEL_UUID}
+ExecStart=${CF_BIN} tunnel --no-autoupdate --config ${CONFIG_FILE} --protocol ${PROTOCOL} --edge-ip-version ${edge_ip_version} --retries 5 run ${TUNNEL_UUID}
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
@@ -701,7 +729,7 @@ install_tunnel() {
 
   require_root
   require_systemd
-  [[ ! -e "$UNIT_FILE" && ! -e "$META_FILE" ]] || die "已存在 ${SERVICE_NAME} 配置。请使用 status、diagnose、update 或先 uninstall。"
+  [[ ! -e "$UNIT_FILE" && ! -e "$META_FILE" && ! -e "$SERVICE_DIR" ]] || die "已存在 ${SERVICE_NAME} 配置或残留文件（可能是上次未完成的安装）。请先执行 'sudo bash $0 uninstall' 清理后重试。"
   ensure_cloudflared
   check_network
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
@@ -731,7 +759,11 @@ status_tunnel() {
     warn "未发现 ${SERVICE_NAME} 的本地配置。"
     return 1
   fi
-  ensure_cloudflared
+  if find_cloudflared; then
+    show_cloudflared_version
+  else
+    warn '未检测到 cloudflared；status 仅查看状态，不会自动安装（需要安装请运行 update）。'
+  fi
   say "Tunnel 名称：${TUNNEL_NAME:-未知}"
   say "Tunnel UUID：${TUNNEL_UUID}"
   say "SSH 域名：${PUBLIC_HOSTNAME}"
@@ -833,8 +865,10 @@ uninstall_tunnel() {
   say '该操作将停止并删除本机 systemd 服务、配置和 Tunnel 专用凭据。'
   say '为避免账户级误删，它不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。'
   [[ -n "$old_uuid" ]] && say "如不再使用，请在 Cloudflare 控制台删除 Tunnel：${old_uuid}"
-  local answer
-  read -r -p '若确认，请输入 DELETE：' answer
+  local answer=''
+  if ! read -r -p '若确认，请输入 DELETE：' answer; then
+    die '未读取到确认输入，已取消。'
+  fi
   [[ "$answer" == 'DELETE' ]] || die '已取消。'
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "$UNIT_FILE"

@@ -11,7 +11,7 @@
 | Tunnel 与 DNS | 自动创建本地管理 Tunnel，并将用户输入的域名 CNAME 到 `<UUID>.cfargotunnel.com`。[1] |
 | SSH 服务路由 | 自动生成 `ssh://localhost:22` ingress 和最后的 `http_status:404` 兜底规则。[2] |
 | 开机运行 | 创建受限 systemd 服务，失败自动重启，服务进程仅可读取该 Tunnel 专用 JSON 凭据。 |
-| SSH 认证 | 不需要额外 Access 控制台配置；继续使用服务器原有的 SSH 密钥或密码认证。 |
+| SSH 认证 | 继续使用服务器原有的 SSH 密钥或密码认证。 |
 | 中国大陆网络 | `--mainland` 强制 HTTP/2（TCP/7844），不依赖 UDP/QUIC；不能承诺任意网络均可用。 |
 
 ## 开始前只需确认两件事
@@ -44,15 +44,15 @@ ssh.example.com
 
 ## 连接与安全边界
 
-Tunnel、DNS 和 SSH 路由在输入域名后即已完成，不需要再进行 Cloudflare Access 控制台操作。客户端仍需要安装 `cloudflared` 作为 SSH 的 Tunnel 代理，随后以服务器现有的 Linux SSH 密钥或密码完成认证。[5]
+Tunnel、DNS 和 SSH 路由在输入域名后即全部完成。客户端仍需要安装 `cloudflared` 作为 SSH 的 Tunnel 代理，随后以服务器现有的 Linux SSH 密钥或密码完成认证。[5]
 
-> 未创建 Cloudflare Access 应用时，该 SSH 域名会向 Internet 公开可达。[6] 这不等于免认证登录：`sshd` 仍会验证你的 Linux SSH 密钥或密码。请优先使用密钥认证，禁用不需要的 root 或密码登录，并保持系统更新。
+> 该 SSH 域名会向 Internet 公开可达。[6] 这不等于免认证登录：`sshd` 仍会验证你的 Linux SSH 密钥或密码。请优先使用密钥认证，禁用不需要的 root 或密码登录，并保持系统更新。
 
 ## 中国大陆 GitHub 加速
 
 当使用 `install --mainland` 时，脚本会自动对以下 GitHub 代理进行 Git 协议测速：`gh-proxy.org`、`v4.gh-proxy.org`、`v6.gh-proxy.org`、`cdn.gh-proxy.org` 与 `axisnow.gh-proxy.org`。只有返回正确 Git `upload-pack` 响应的代理才会参与比较，脚本将选择总耗时最低的可用项。
 
-选中后，脚本通过 Git 全局 `url.<代理>https://github.com/.insteadOf` 规则加速当前管理员账户访问 `https://github.com/` 的 Git 克隆与拉取。它**不会**设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会代理 apt 更新、Cloudflare 授权、Tunnel 连接或系统其他网络流量。
+选中后，脚本通过 Git 全局 `url.<代理>https://github.com/.insteadOf` 规则加速当前管理员账户访问 `https://github.com/` 的 Git 克隆与拉取，并配套 `pushInsteadOf` 反向规则保证 `git push` 仍直连 GitHub。它**不会**设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会代理 apt 更新、Cloudflare 授权、Tunnel 连接或系统其他网络流量。
 
 对于未安装 `cloudflared` 的 Debian amd64 主机，`install --mainland` 也会从相同候选项中测试 Cloudflare 官方 GitHub Release `.deb` 文件的下载能力，并选择最快兼容项。下载前脚本通过 GitHub 官方 Release 页面取得版本与 SHA-256；下载后会验证 SHA-256 和 Debian 包结构，校验通过才交给 APT 安装。若元数据、代理下载、校验或安装失败，脚本自动回退到 Cloudflare 官方签名 APT 软件源。代理速度会随时间和线路变化，可随时重新测速：
 

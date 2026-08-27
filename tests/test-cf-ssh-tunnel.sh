@@ -39,13 +39,13 @@ assert_contains "$help_output" '输出浏览器授权链接' '帮助文本说明
 assert_contains "$help_output" '自动创建 Tunnel、DNS 路由、SSH 配置和系统服务' '帮助文本说明自动配置范围'
 assert_contains "$help_output" '本脚本不会开放服务器入站端口' '帮助文本声明安全边界'
 assert_contains "$help_output" 'github-proxy [--show|--disable]' '帮助文本包含 GitHub 代理管理命令'
-assert_contains "$help_output" 'GitHub 代理仅写入 Git 的 github.com 规则' '帮助文本限制代理影响范围'
+assert_contains "$help_output" 'GitHub 代理仅影响 Git 的 github.com 克隆与拉取' '帮助文本限制代理影响范围'
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
 assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Tunnel ProxyCommand'
 assert_contains "$client_output" 'ssh <你的 Linux 用户名>@ssh.example.com' '客户端配置包含连接命令'
 assert_contains "$client_output" 'Linux 原有的 SSH 密钥或密码认证' '客户端配置说明标准 SSH 认证'
-assert_not_contains "$client_output" '配置 Access Self-hosted 应用' '客户端配置不要求 Access 控制台操作'
+assert_not_contains "$client_output" 'Access' '客户端配置不涉及 Access'
 
 set +e
 bash "$SCRIPT" unexpected-command >/tmp/cf-ssh-tunnel-test.stderr 2>&1
@@ -70,12 +70,48 @@ if validate_hostname 'SSH.EXAMPLE.COM'; then
 fi
 pass '未规范化的大写域名被拒绝'
 
+# 行为测试：毫秒换算边界
+[[ "$(seconds_to_milliseconds '0.521')" == '521' ]] || fail '毫秒换算错误：0.521 应为 521'
+pass '毫秒换算行为正确（0.521 -> 521）'
+[[ "$(seconds_to_milliseconds '.5')" == '500' ]] || fail '毫秒换算错误：.5 应为 500'
+pass '毫秒换算行为正确（.5 -> 500）'
+[[ "$(seconds_to_milliseconds '12')" == '12000' ]] || fail '毫秒换算错误：12 应为 12000'
+pass '毫秒换算行为正确（12 -> 12000）'
+
+# 行为测试：同一域名生成确定的 Tunnel 名称
+# shellcheck disable=SC2034  # 由 source 进来的 make_tunnel_name 读取
+PUBLIC_HOSTNAME='ssh.example.com'
+make_tunnel_name
+tunnel_name_first="$TUNNEL_NAME"
+make_tunnel_name
+[[ "$TUNNEL_NAME" == "$tunnel_name_first" ]] || fail '同一域名应生成相同的 Tunnel 名称'
+pass 'Tunnel 名称按域名确定性生成'
+
+# 行为测试：代理清理同时移除 insteadOf 与 pushInsteadOf（隔离 HOME，不污染真实 gitconfig）
+if command -v git >/dev/null 2>&1; then
+  proxy_test_home="$(mktemp -d)"
+  proxy_old_home="$HOME"
+  HOME="$proxy_test_home"
+  git config --global 'url.https://gh-proxy.org/https://github.com/.insteadOf' 'https://github.com/'
+  git config --global 'url.https://github.com/.pushInsteadOf' 'https://gh-proxy.org/https://github.com/'
+  remove_known_github_proxies
+  if git config --global --get 'url.https://gh-proxy.org/https://github.com/.insteadOf' >/dev/null 2>&1 \
+    || git config --global --get 'url.https://github.com/.pushInsteadOf' >/dev/null 2>&1; then
+    HOME="$proxy_old_home"
+    rm -rf "$proxy_test_home"
+    fail '代理清理应同时删除 insteadOf 与 pushInsteadOf'
+  fi
+  HOME="$proxy_old_home"
+  rm -rf "$proxy_test_home"
+  pass '代理清理同时移除 insteadOf 与 pushInsteadOf 规则'
+fi
+
 script_text="$(cat "$SCRIPT")"
 assert_contains "$script_text" 'ensure_cloudflared()' '包含 cloudflared 自动检测函数'
 assert_contains "$script_text" "info '未安装 cloudflared，开始自动安装。'" '未安装时触发自动安装'
 assert_contains "$script_text" "\"\$CF_BIN\" tunnel login" '包含 Cloudflare 浏览器授权命令'
 assert_contains "$script_text" 'show_connection_notice' '完成流程直接输出连接提示'
-assert_not_contains "$script_text" 'show_access_notice' '完成流程不要求 Access 控制台步骤'
+assert_not_contains "$script_text" 'Access' '脚本全文不涉及 Access 流程'
 assert_contains "$script_text" 'https:// 开头的授权链接' '以中文说明授权链接'
 assert_contains "$script_text" "tunnel --origincert \"\$CERT_FILE\" create \"\$TUNNEL_NAME\"" '使用授权证书自动创建 Tunnel'
 assert_contains "$script_text" "route dns \"\$TUNNEL_UUID\" \"\$PUBLIC_HOSTNAME\"" '自动创建域名 DNS 路由'
@@ -111,6 +147,12 @@ assert_contains "$script_text" "dpkg-deb -I \"\$tmp\"" '校验下载文件为有
 assert_contains "$script_text" "chmod 0644 \"\$tmp\"" '允许 APT 沙箱读取已校验的临时 Debian 包'
 assert_contains "$script_text" "actual_sha\" != \"\$expected_sha" '哈希不一致时拒绝安装'
 assert_contains "$script_text" 'Cloudflare 官方签名软件源' '代理下载失败时回退官方签名软件源'
+assert_contains "$script_text" 'pushInsteadOf' '推送经反向规则保持直连 GitHub'
+assert_contains "$script_text" 'curl_secure --max-time 600' '按吞吐放宽代理 deb 下载时限'
+assert_contains "$script_text" '--edge-ip-version ${edge_ip_version}' '按协议选择边缘 IP 版本'
+assert_contains "$script_text" 'already[[:space:]]exists' '同名 Tunnel 冲突有针对性提示'
+assert_contains "$script_text" '&& ! -e "$SERVICE_DIR" ]]' '安装前检测残留配置目录'
+assert_contains "$script_text" "trap 'cleanup_login_certificate; exit 130' INT" 'Ctrl-C 中断也清理授权证书'
 assert_contains "$script_text" "\"\$PROTOCOL\" == 'http2'" '仅中国大陆模式尝试代理下载'
 assert_contains "$script_text" "rm -rf \"\$LOGIN_HOME\"" '授权后的账户级证书会被清理'
 
