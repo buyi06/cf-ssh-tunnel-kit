@@ -2,7 +2,9 @@
 
 > **无显示器 Linux 的全中文 Cloudflare SSH Tunnel 一键部署工具。** 执行一条命令，自动安装 `cloudflared`（已安装则跳过）、终端显示浏览器授权链接、填写域名后自动创建 Tunnel、DNS 路由、SSH 配置和托管服务：有正在运行的 systemd 时创建 systemd 服务，Docker 容器、DSW/Colab、WSL 等没有 systemd 的环境自动改用独立后台进程。
 
-它适合家用 Linux、小主机、NAS、树莓派、没有公网入站 IP 的云服务器，以及 ModelScope DSW 这类只有容器的开发环境。脚本只把 Cloudflare Tunnel 接到本机 `ssh://localhost:22`，不会开放服务器入站 `22` 端口，不改动 `sshd_config`，也不创建裸 TCP SSH 公网转发。
+它适合家用 Linux、小主机、NAS、树莓派、没有公网入站 IP 的云服务器，以及 ModelScope DSW 这类只有容器的开发环境。脚本只把 Cloudflare Tunnel 接到本机 `ssh://localhost:22`，不会开放服务器入站 `22` 端口，也不创建裸 TCP SSH 公网转发。
+
+为了装完就能登，脚本会做一次 SSH 登录体检：账户没有公钥也没有可用密码时生成一个随机密码；sshd 禁止密码登录时会**先问一句**（或加 `--allow-password` 免问），同意后才写入 `sshd_config.d` 下的独立文件放行，写入前备份、`sshd -t` 校验不通过立即回滚，`credentials` 里可随时看到还原方式。
 
 ## 一条命令开始
 
@@ -48,6 +50,7 @@ sudo bash start.sh
 > ```bash
 > sudo bash scripts/cf-ssh-tunnel.sh credentials                # 域名、用户、认证方式、已授权公钥指纹
 > sudo bash scripts/cf-ssh-tunnel.sh credentials --set-password # 生成新密码并打印
+> sudo bash scripts/cf-ssh-tunnel.sh credentials --set-password --allow-password  # sshd 禁止密码登录时一并放行
 > ```
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
@@ -124,7 +127,7 @@ ssh root@ssh.example.com
 | 检查网络、SSH 和日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 cloudflared | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 查看/开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
-| 查看登录信息 / 重置登录密码 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password]` |
+| 查看登录信息 / 重置密码 / 放行密码登录 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password] [--allow-password]` |
 | 输出客户端 SSH 配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
 | 删除本机服务与专用凭据 | `sudo bash scripts/cf-ssh-tunnel.sh uninstall` |
 

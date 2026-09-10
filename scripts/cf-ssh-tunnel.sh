@@ -39,8 +39,10 @@ RELEASE_PAGE_URL=''
 SSHD_CONFIG_FILE=''
 SSH_AUTH_METHOD=''
 SSH_PASSWORD=''
+SSHD_CHANGE=''
 FORCE_PASSWORD=0
 NO_PASSWORD=0
+ALLOW_PASSWORD=0
 CF_BIN=''
 PACKAGE_MANAGER=''
 TUNNEL_UUID=''
@@ -86,7 +88,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh logs
   sudo bash cf-ssh-tunnel.sh restart
   sudo bash cf-ssh-tunnel.sh diagnose
-  sudo bash cf-ssh-tunnel.sh credentials [--set-password]
+  sudo bash cf-ssh-tunnel.sh credentials [--set-password|--allow-password]
   sudo bash cf-ssh-tunnel.sh update
   sudo bash cf-ssh-tunnel.sh autostart [--show|--enable|--disable]
   sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
@@ -106,11 +108,12 @@ usage() {
   --quic         固定使用 QUIC（UDP/7844）。
   --set-password 额外生成一个随机登录密码并打印（即使本机已有公钥）。
   --no-password  不设置密码，只检查并显示现有登录方式。
+  --allow-password 允许脚本在 sshd 禁止密码登录时自动放行（写入 sshd 配置并校验、可还原）。
   status         显示 Tunnel 名称、域名、托管方式、进程状态和本机 SSH 状态。
   logs           查看最近 80 行 Tunnel 日志：systemd 用 journalctl，进程模式读日志文件。
   restart        重启 Tunnel 服务，systemd 与进程模式都可用；容器重启后也用它重新拉起。
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
-  credentials    显示登录所需的全部信息（域名、用户名、认证方式、已授权公钥指纹）；带上 --set-password 会生成并设置一个新密码后打印。
+  credentials    显示登录所需的全部信息（域名、用户名、认证方式、已授权公钥指纹）；--set-password 生成并设置新密码后打印，--allow-password 在 sshd 禁止密码登录时自动放行。
   update         使用系统包管理器更新 cloudflared。
   autostart      查看或开关「登录自启」：无 systemd 的环境下，登录 shell 时自动拉起 Tunnel。
   github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
@@ -126,9 +129,12 @@ usage() {
   自动拉起 Tunnel；用 autostart --disable 关闭，或 autostart --show 查看当前状态。
 
 安全说明：
-  本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
+  本脚本不会开放服务器入站端口，也不创建裸 TCP/22 公网转发。
   若目标账户既没有公钥、也没有可用密码，脚本会生成一个随机密码写入本机 /etc/shadow 并只打印一次，
   保证 Tunnel 建好后立刻能登录（用 --no-password 关闭该行为，用 --set-password 强制重置密码）。
+  若 sshd 本身禁止该账户用密码登录：交互运行时脚本会先询问，回答 Y 或加 --allow-password 才会写入
+  sshd 配置放行（优先写入 sshd_config.d 下的独立文件；写入前备份、写入后 sshd -t 校验，不通过立即回滚）。
+  该改动会在输出中明确显示，随时可用 credentials 查看还原方式。
   脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；连接继续使用 Linux 原有的 SSH 密钥或密码认证。
   GitHub 代理仅影响 Git 的 github.com 克隆与拉取（git push 仍直连 GitHub），不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
 EOF
@@ -622,14 +628,130 @@ user_has_password() {
   [[ -n "$field" && "$field" != '!'* && "$field" != '*'* ]]
 }
 
+sshd_config_path() {
+  printf '%s' "${SSHD_CONFIG_FILE:-/etc/ssh/sshd_config}"
+}
+
+sshd_effective_config() {
+  sshd -T -f "$(sshd_config_path)" 2>/dev/null || true
+}
+
+sshd_dropin_path() {
+  printf '%s/sshd_config.d/99-cf-ssh-tunnel.conf' "$(dirname "$(sshd_config_path)")"
+}
+
+sshd_login_change_pending() {
+  [[ -n "$SSHD_CHANGE" ]]
+}
+
+revert_sshd_login_change() {
+  local config backup
+  config="$(sshd_config_path)"
+  backup="${config}.cf-ssh-tunnel.bak"
+  case "$SSHD_CHANGE" in
+    dropin) rm -f "$(sshd_dropin_path)" ;;
+    inline)
+      if [[ -e "$backup" ]]; then
+        install -o root -g root -m 0644 "$backup" "$config"
+      fi
+      ;;
+  esac
+  SSHD_CHANGE=''
+}
+
+reload_sshd() {
+  local pid=''
+  if systemd_available && { systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1; }; then
+    return 0
+  fi
+  # 容器里没有 systemd：只给监听端口的 sshd 主进程发 HUP，避免误伤正在会话中的子进程。
+  if command -v ss >/dev/null 2>&1; then
+    pid="$(ss -lntp 2>/dev/null | grep 'sshd' | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2 || true)"
+  fi
+  if [[ -z "$pid" ]] && command -v pgrep >/dev/null 2>&1; then
+    local candidate=''
+    for candidate in $(pgrep -x sshd); do
+      if [[ "$(ps -o ppid= -p "$candidate" 2>/dev/null | tr -d ' ')" == '1' ]]; then
+        pid="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$pid" ]]; then
+    kill -HUP "$pid" 2>/dev/null || true
+    return 0
+  fi
+  warn '未能自动重载 sshd：请手工执行 systemctl reload ssh（容器内可 pkill -x sshd 后重新启动 sshd）。'
+}
+
+allow_password_login() {
+  local user="$1" config dropin dropin_dir backup tmp='' effective=''
+  config="$(sshd_config_path)"
+  [[ -r "$config" ]] || die "未找到 sshd 配置文件：${config}"
+  dropin_dir="$(dirname "$config")/sshd_config.d"
+  dropin="$(sshd_dropin_path)"
+  backup="${config}.cf-ssh-tunnel.bak"
+  [[ -e "$backup" ]] || cp -a "$config" "$backup"
+
+  tmp="$(mktemp)"
+  {
+    printf '# 由 cf-ssh-tunnel-kit 写入：允许 Tunnel 后的 SSH 使用密码登录。\n'
+    printf '# 还原方式：删除本文件（或 sshd_config 顶部的同名标记段），再重载 sshd。\n'
+    printf 'PasswordAuthentication yes\n'
+    if [[ "$user" == 'root' ]]; then
+      printf 'PermitRootLogin yes\n'
+    fi
+  } >"$tmp"
+
+  if grep -qE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$config"; then
+    install -d -o root -g root -m 0755 "$dropin_dir"
+    install -o root -g root -m 0644 "$tmp" "$dropin"
+    SSHD_CHANGE='dropin'
+    rm -f "$tmp"
+  else
+    # 老系统没有 Include：插到配置最前面（sshd 只认第一个出现的同名项）。
+    local merged
+    merged="$(mktemp)"
+    { cat "$tmp"; printf '\n'; cat "$config"; } >"$merged"
+    install -o root -g root -m 0644 "$merged" "$config"
+    rm -f "$merged" "$tmp"
+    SSHD_CHANGE='inline'
+  fi
+
+  if ! sshd -t -f "$config" 2>/dev/null; then
+    revert_sshd_login_change
+    die 'sshd 配置校验未通过，已回滚放行改动。请手工检查 sshd 配置。'
+  fi
+  reload_sshd
+  effective="$(sshd_effective_config)"
+  if ! grep -qi '^passwordauthentication yes' <<<"$effective"; then
+    revert_sshd_login_change
+    warn '放行后 sshd 仍报告不允许密码登录，已回滚改动。'
+    return 1
+  fi
+  if [[ "$user" == 'root' ]] && ! grep -qi '^permitrootlogin yes' <<<"$effective"; then
+    revert_sshd_login_change
+    warn '放行后 sshd 仍禁止 root 使用密码登录，已回滚改动。'
+    return 1
+  fi
+  info '已放行密码登录并重载 sshd（改动可随时还原，见 credentials 输出）。'
+  return 0
+}
+
+confirm_allow_password() {
+  local user="$1" answer=''
+  [[ -t 0 ]] || return 1
+  say
+  warn "服务器 sshd 当前不允许账户 ${user} 使用密码登录；放行会改变整机的 SSH 登录策略。"
+  if ! read -r -p '是否自动放行密码登录并继续？[Y/n] ' answer; then
+    return 1
+  fi
+  [[ -z "$answer" || "$answer" =~ ^[Yy] ]]
+}
+
 password_login_allowed() {
   local user="$1" effective=''
-  # SSHD_CONFIG_FILE 仅用于测试与特殊部署：留空时读取系统 sshd 有效配置。
-  if [[ -n "$SSHD_CONFIG_FILE" ]]; then
-    effective="$(sshd -T -f "$SSHD_CONFIG_FILE" 2>/dev/null || true)"
-  else
-    effective="$(sshd -T 2>/dev/null || true)"
-  fi
+  effective="$(sshd_effective_config)"
   # 无法读取有效配置时不阻塞流程，交由用户按提示判断。
   [[ -n "$effective" ]] || return 0
   grep -qi '^passwordauthentication yes' <<<"$effective" || return 1
@@ -679,13 +801,17 @@ check_ssh_login() {
   fi
 
   if ! password_login_allowed "$user"; then
-    warn "服务器 sshd 当前不允许账户 ${user} 使用密码登录，脚本不会代改 sshd_config。"
-    say '如需改用密码登录，请在服务器上执行（Debian/Ubuntu/RHEL9 等支持 sshd_config.d 的系统）：'
-    say "    printf 'PasswordAuthentication yes\\nPermitRootLogin yes\\n' > /etc/ssh/sshd_config.d/99-cf-ssh-tunnel.conf"
-    say '    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || kill -HUP "$(pgrep -x sshd | head -n 1)"'
-    say '    （老系统需手工修改 /etc/ssh/sshd_config 中对应的行，sshd 只认第一个出现的同名项）'
-    say "然后执行：sudo bash $0 credentials --set-password"
-    return 0
+    if (( ALLOW_PASSWORD == 1 )); then
+      allow_password_login "$user" || return 0
+    elif confirm_allow_password "$user"; then
+      allow_password_login "$user" || return 0
+    else
+      warn "服务器 sshd 当前不允许账户 ${user} 使用密码登录，本次未放行。"
+      say '想自动放行并设置密码，执行：'
+      say "    sudo bash $0 credentials --set-password --allow-password"
+      say '或手工放行后重载 sshd：PasswordAuthentication yes（root 还需 PermitRootLogin yes）。'
+      return 0
+    fi
   fi
 
   SSH_PASSWORD="$(generate_password)"
@@ -1284,6 +1410,7 @@ install_tunnel() {
       --quic) PROTOCOL='quic' ;;
       --set-password) FORCE_PASSWORD=1 ;;
       --no-password) NO_PASSWORD=1 ;;
+      --allow-password) ALLOW_PASSWORD=1 ;;
       -h|--help) usage; return 0 ;;
       *) die "未知 install 选项：$1" ;;
     esac
@@ -1457,13 +1584,27 @@ Host ${hostname}
 EOF
 }
 
+describe_sshd_change() {
+  if ! sshd_login_change_pending; then
+    return 0
+  fi
+  if [[ "$SSHD_CHANGE" == 'dropin' ]]; then
+    say "已放行密码登录：$(sshd_dropin_path)"
+    say '    还原方式：删除该文件后重载 sshd（systemctl reload ssh 或 kill -HUP <sshd 主进程>）。'
+  else
+    say "已放行密码登录：$(sshd_config_path) 顶部（原文件备份在 $(sshd_config_path).cf-ssh-tunnel.bak）"
+    say '    还原方式：用备份覆盖回去后重载 sshd。'
+  fi
+}
+
 manage_credentials() {
   local user=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --set-password) FORCE_PASSWORD=1 ;;
+      --allow-password) ALLOW_PASSWORD=1 ;;
       --show) : ;;
-      *) die 'credentials 仅支持 --show 或 --set-password。' ;;
+      *) die 'credentials 仅支持 --show、--set-password 或 --allow-password。' ;;
     esac
     shift
   done
@@ -1472,6 +1613,7 @@ manage_credentials() {
   user="${INSTALL_USER:-root}"
   say '== SSH 登录体检 =='
   check_ssh_login "$user"
+  describe_sshd_change
   say
   print_connection_info "$user"
 }
@@ -1504,6 +1646,9 @@ uninstall_tunnel() {
     fi
   fi
   info '本机 Tunnel 服务和专用凭据已删除。'
+  if [[ -e "$(sshd_dropin_path)" ]]; then
+    say "提示：之前放行密码登录写入的 $(sshd_dropin_path) 仍然保留；不需要时删除它并重载 sshd 即可。"
+  fi
 }
 
 main() {
@@ -1515,7 +1660,7 @@ main() {
     logs) [[ $# -eq 0 ]] || die 'logs 不接受额外参数。'; show_tunnel_logs ;;
     restart) [[ $# -eq 0 ]] || die 'restart 不接受额外参数。'; restart_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
-    credentials) [[ $# -le 1 ]] || die 'credentials 最多接受一个选项。'; manage_credentials "$@" ;;
+    credentials) [[ $# -le 2 ]] || die 'credentials 最多接受两个选项。'; manage_credentials "$@" ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
     autostart) [[ $# -le 1 ]] || die 'autostart 最多接受一个选项。'; manage_autostart "${1:-}" ;;
     github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;

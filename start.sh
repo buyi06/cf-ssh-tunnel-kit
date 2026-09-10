@@ -23,7 +23,7 @@ trap - ERR EXIT HUP INT TERM
 usage() {
   cat <<'EOF'
 用法：
-  sudo bash start.sh [--mainland|--auto|--quic] [--no-update]
+  sudo bash start.sh [--mainland|--auto|--quic] [--allow-password] [--no-update]
 
 一条命令完成：更新项目代码 → 安装或拉起 Tunnel → 打印可直接复制的连接信息。
 首次运行等价于 install（含浏览器授权）；已安装过时只加载现有配置，服务没在跑才拉起，
@@ -36,6 +36,9 @@ usage() {
   --auto       先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2。
   --quic       固定使用 QUIC（UDP/7844）。
   --no-update  跳过 git 拉取更新，直接用当前代码启动。
+  --allow-password
+               若 sshd 禁止密码登录，直接放行（写 sshd 配置并校验，可还原）；不加该选项时，
+               在终端里会先问一句，回车即放行。
 
 中国大陆直连 GitHub 超时时，脚本会自动测速并改用候选加速代理拉取代码；全部不可用时
 跳过更新、用当前版本继续启动。容器等没有 systemd 的环境会自动改用后台看护进程托管：
@@ -95,12 +98,18 @@ update_repo() {
 }
 
 load_or_install() {
-  local protocol="$1"
+  local protocol="$1" allow_password="$2"
   detect_service_mode
+  # shellcheck disable=SC2034  # 由 source 进来的 check_ssh_login 读取
+  ALLOW_PASSWORD="$allow_password"
   if [[ ! -r "$META_FILE" ]]; then
     say
     info '未检测到本机配置，开始首次安装。'
-    bash "$MAIN_SCRIPT" install "$protocol"
+    if (( allow_password == 1 )); then
+      bash "$MAIN_SCRIPT" install "$protocol" --allow-password
+    else
+      bash "$MAIN_SCRIPT" install "$protocol"
+    fi
     return 0
   fi
 
@@ -128,10 +137,11 @@ load_or_install() {
 }
 
 main() {
-  local protocol='--mainland' do_update=1
+  local protocol='--mainland' do_update=1 allow_password=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mainland|--auto|--quic) protocol="$1" ;;
+      --allow-password) allow_password=1 ;;
       --no-update) do_update=0 ;;
       -h|--help) usage; return 0 ;;
       *) die "未知选项：$1（运行 'bash $0 --help' 查看用法）" ;;
@@ -143,7 +153,7 @@ main() {
   if (( do_update == 1 )); then
     update_repo
   fi
-  load_or_install "$protocol"
+  load_or_install "$protocol" "$allow_password"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

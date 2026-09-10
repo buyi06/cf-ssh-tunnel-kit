@@ -2,7 +2,7 @@
 
 > 本工具服务于没有显示器、只有命令行的 Linux 主机。它会自动检测或安装 `cloudflared`，在终端显示 Cloudflare 浏览器授权链接；授权完成后，只需要输入 SSH 域名，脚本便会自动创建 Tunnel、DNS CNAME 路由、`ssh://localhost:22` ingress 配置和托管服务（优先 systemd，容器等无 systemd 环境自动改用后台进程）。
 
-脚本位于 [`scripts/cf-ssh-tunnel.sh`](../scripts/cf-ssh-tunnel.sh)。它不会开放服务器的入站 `22` 端口，不会改动 `sshd_config`，也不会将 Tunnel 凭据写进命令行、日志或 Git 仓库。
+脚本位于 [`scripts/cf-ssh-tunnel.sh`](../scripts/cf-ssh-tunnel.sh)。它不会开放服务器的入站 `22` 端口，也不会将 Tunnel 凭据写进命令行、日志或 Git 仓库。唯一可能触及 `sshd` 配置的场景，是「sshd 禁止密码登录、而账户又没有公钥」时按你的确认放行密码登录（见下文「登录信息」），该改动有备份、有校验、可随时还原。
 
 | 项目 | 自动完成的内容 |
 |---|---|
@@ -81,7 +81,7 @@ ssh.example.com
 | 该账户已有公钥（`~/.ssh/authorized_keys` 有有效条目） | 只列出公钥指纹，**不动密码**；指纹对不上时提示改用密码 |
 | 既没有公钥、密码又是空的/被锁 | 生成 16 位随机密码，写入本机 `/etc/shadow`，**只打印一次**，不写入任何文件 |
 | 既没有公钥、但账户已有密码 | 如实说明「Linux 不保存明文，脚本读不出来」，并提示用 `credentials --set-password` 重置 |
-| sshd 不允许该账户用密码登录 | 不改 `sshd_config`，打印放行所需的 drop-in 命令后退出 |
+| sshd 不允许该账户用密码登录 | 交互运行时先询问；回答 Y 或带 `--allow-password` 才写 sshd 配置放行（写入前备份、`sshd -t` 校验失败立即回滚），否则只打印手工放行命令 |
 
 任何时候都可以重新查看或重置，不用重装：
 
@@ -90,7 +90,18 @@ sudo bash scripts/cf-ssh-tunnel.sh credentials                # 域名、用户�
 sudo bash scripts/cf-ssh-tunnel.sh credentials --set-password # 生成并设置一个新密码后打印
 ```
 
-> 安装时也可以直接指定：`install --set-password`（即使已有公钥也生成密码，两条路都能登）或 `install --no-password`（只体检、绝不改密码）。脚本**不会**修改 `sshd_config`；密码以哈希形式保存在本机 `/etc/shadow`，脚本自身不留任何明文副本。建议连上之后按上面 ③ 换成密钥登录。
+> 安装时也可以直接指定：`install --set-password`（即使已有公钥也生成密码，两条路都能登）、`install --no-password`（只体检、绝不改密码）或 `install --allow-password`（sshd 禁止密码登录时免询问直接放行）。密码以哈希形式保存在本机 `/etc/shadow`，脚本自身不留任何明文副本。建议连上之后按上面 ③ 换成密钥登录。
+
+### 放行密码登录时脚本改了什么
+
+仅当 sshd 本身禁止该账户用密码登录、且需要密码登录时才发生，改动完全可还原：
+
+| 系统情况 | 脚本动作 |
+|---|---|
+| `sshd_config` 里有 `Include .../sshd_config.d/*.conf`（Debian 12 / Ubuntu 22+ / RHEL9 等） | 写入独立文件 `sshd_config.d/99-cf-ssh-tunnel.conf`（`PasswordAuthentication yes`，root 另加 `PermitRootLogin yes`），主配置不动 |
+| 老系统没有 Include | 把同样的三行插到 `sshd_config` 顶部（sshd 只认第一个出现的同名项），原文件备份为 `sshd_config.cf-ssh-tunnel.bak` |
+
+写入后一定执行 `sshd -t` 语法校验并重载 sshd，再用 `sshd -T` 复核是否真正生效；**校验失败或未生效都会自动回滚**，不会把一个坏配置留在机器上。`credentials` 会打印当前改动与还原方式，`uninstall` 也会提醒该文件仍然存在。
 
 ## 连接与安全边界
 
@@ -177,7 +188,7 @@ ssh root@ssh.example.com
 | 重启 Tunnel（容器/机器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和最近日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
-| 查看登录信息 / 重置登录密码 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password]` |
+| 查看登录信息 / 重置密码 / 放行密码登录 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password] [--allow-password]` |
 | 更新或安装 `cloudflared` | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 查看或开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
 | 输出客户端配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
@@ -197,7 +208,7 @@ ssh root@ssh.example.com
 
 **SSH 仍然连接失败。** 先运行 `diagnose`，确认托管服务处于运行状态（systemd 模式看服务 `active`，进程模式看 PID 与日志尾部），再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5] 如果卡在 `Permission denied (publickey,password)`，说明链路是通的、只是认证没对上：运行 `credentials` 看服务器上有哪些公钥；都不是你的就用 `credentials --set-password` 生成一个密码再连。
 
-**登录密码是多少？脚本读不出服务器上原有的密码。** Linux 只保存哈希，任何工具都无法还原明文。三种处理：用你当初设置的那个密码；用自己手上的私钥（`credentials` 会列出服务器已授权的公钥指纹）；或者执行 `credentials --set-password` 重置为一个新密码——脚本会把新密码打印出来，且只打印这一次。若提示 sshd 不允许密码登录，按输出里的 drop-in 命令放行后重试（脚本不代改 `sshd_config`）。
+**登录密码是多少？脚本读不出服务器上原有的密码。** Linux 只保存哈希，任何工具都无法还原明文。三种处理：用你当初设置的那个密码；用自己手上的私钥（`credentials` 会列出服务器已授权的公钥指纹）；或者执行 `credentials --set-password` 重置为一个新密码——脚本会把新密码打印出来，且只打印这一次。若提示 sshd 不允许密码登录，执行 `credentials --set-password --allow-password` 让脚本自动放行并设置密码，或按输出里的命令手工放行。
 
 **容器里提示「未检测到正在运行的 systemd」。** 这不是错误。脚本会自动改用后台看护进程继续安装：Tunnel 崩溃后会自动重启，容器/机器重启后首次登录 shell 会自动拉起。若提示未检测到 22 端口的 SSH 服务，请先在容器内启动 `sshd`，否则 Tunnel 没有可转发的目标。
 
