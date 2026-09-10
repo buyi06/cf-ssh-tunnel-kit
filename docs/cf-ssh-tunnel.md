@@ -90,12 +90,13 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 
 | 项目 | systemd 模式 | 进程模式（Docker 容器、DSW/Colab、WSL 等） |
 |---|---|---|
-| 启动方式 | `systemctl enable --now cf-ssh-tunnel` | `setsid nohup cloudflared … &`，脱离终端会话 |
+| 启动方式 | `systemctl enable --now cf-ssh-tunnel` | `setsid` 启动看护脚本 `run.sh`，脱离终端会话 |
 | 运行账户 | 专用 `cf-ssh-tunnel` 系统账户 | 当前 root |
 | 凭据与配置权限 | `0640 root:cf-ssh-tunnel` | `0600 root:root` |
-| 运行状态 | `systemctl status cf-ssh-tunnel` | PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid`（丢失时按命令行回退定位） |
+| 崩溃自愈 | `Restart=on-failure` | 看护脚本重启 Tunnel，间隔 5 秒起、最长 60 秒 |
+| 系统/容器重启后 | systemd 开机自启 | 首次登录 shell 自动拉起（`/etc/profile.d/cf-ssh-tunnel-autostart.sh`） |
+| 运行状态 | `systemctl status cf-ssh-tunnel` | PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid`（丢失时按看护脚本路径回退定位） |
 | 日志 | `journalctl -u cf-ssh-tunnel` | `/etc/cf-ssh-tunnel/tunnel.log` |
-| 系统/容器重启后 | 自动拉起 | **不会自动拉起**，需执行 `restart` |
 | SSH 检查 | 服务名 + 22 端口 | 22 端口监听或 `sshd` 进程 |
 
 因此容器里同样是一条命令装完即用：
@@ -103,10 +104,13 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 ```bash
 sudo bash start.sh                             # 首次安装；容器重启后也可以直接再跑一次
 sudo bash scripts/cf-ssh-tunnel.sh restart     # 只想拉起服务时
-sudo bash scripts/cf-ssh-tunnel.sh logs
+sudo bash scripts/cf-ssh-tunnel.sh logs        # 看护进程的重启记录与 cloudflared 输出都在这里
+sudo bash scripts/cf-ssh-tunnel.sh autostart --show
 ```
 
-> 进程模式的 Tunnel 进程独立于当前终端，关掉终端或断开 SSH 不会中断，但容器重建、实例回收后一切都会丢失，需要重新执行 `install`（Tunnel 与 DNS 记录仍在 Cloudflare，重复执行会直接加载现有配置）。容器内必须先有监听 `22` 端口的 `sshd`，否则脚本会拒绝创建指向空服务的 Tunnel，并提示安装方式。
+保活分两层：**崩溃自愈**由看护脚本负责（Tunnel 异常退出后按 5 秒起步的退避间隔重启，最长 60 秒，避免崩溃循环刷日志）；**重启自启**由 profile.d 钩子负责——容器或机器重启后，任意一次登录 shell（例如打开终端）会检查并在必要时拉起 Tunnel，重复登录不会重复启动。不需要时执行 `autostart --disable` 关闭（或直接删除该文件），`uninstall` 也会一并清理。
+
+> 进程模式的 Tunnel 独立于当前终端，关掉终端或断开 SSH 不会中断；但容器重建、实例回收后 `/etc` 下的配置与凭据都会丢失，需要重新执行 `install`（Cloudflare 上的 Tunnel 与 DNS 记录仍在，同名 Tunnel 需先在控制台删除，否则脚本会提示已存在同名 Tunnel）。容器内必须先有监听 `22` 端口的 `sshd`，否则脚本会拒绝创建指向空服务的 Tunnel，并提示安装方式。
 
 ## 客户端连接
 
@@ -136,6 +140,7 @@ ssh root@ssh.example.com
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和最近日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 `cloudflared` | `sudo bash scripts/cf-ssh-tunnel.sh update` |
+| 查看或开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
 | 输出客户端配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
 | 删除本机服务与专用凭据 | `sudo bash scripts/cf-ssh-tunnel.sh uninstall` |
 
@@ -153,7 +158,9 @@ ssh root@ssh.example.com
 
 **SSH 仍然连接失败。** 先运行 `diagnose`，确认托管服务处于运行状态（systemd 模式看服务 `active`，进程模式看 PID 与日志尾部），再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
 
-**容器里提示「未检测到正在运行的 systemd」。** 这不是错误。脚本会自动改用后台进程模式继续安装，只是不会随容器重启自启；重启后执行 `sudo bash scripts/cf-ssh-tunnel.sh restart`。若提示未检测到 22 端口的 SSH 服务，请先在容器内启动 `sshd`，否则 Tunnel 没有可转发的目标。
+**容器里提示「未检测到正在运行的 systemd」。** 这不是错误。脚本会自动改用后台看护进程继续安装：Tunnel 崩溃后会自动重启，容器/机器重启后首次登录 shell 会自动拉起。若提示未检测到 22 端口的 SSH 服务，请先在容器内启动 `sshd`，否则 Tunnel 没有可转发的目标。
+
+**Tunnel 反复重启或需要确认保活是否生效。** 执行 `sudo bash scripts/cf-ssh-tunnel.sh logs`：看护进程每次重启都会写入一行 `[看护] Tunnel 进程退出（退出码 N，存活 N 秒），N 秒后重启`。持续出现说明 Tunnel 起不来（多为网络或凭据问题），而不是保活失效。日志文件过大时可自行截断：`sudo truncate -s 0 /etc/cf-ssh-tunnel/tunnel.log`（Tunnel 运行不受影响）。
 
 **`git clone` 报 `Failed to connect to github.com port 443`。** 这是本机到 GitHub 的网络问题，与脚本无关。改用加速地址克隆（见上文「中国大陆 GitHub 加速」），或在能连通 GitHub 的机器上克隆后拷贝目录过去。安装完成后脚本配置的 Git 加速会让后续 `git pull` 自动走代理。
 

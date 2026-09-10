@@ -4,7 +4,9 @@
 
 ## 服务托管方式
 
-`cloudflared` 本身不依赖 systemd，systemd 只是本项目的托管手段之一。脚本同时支持两种托管方式：检测到 `systemctl` 且 `/run/systemd/system` 存在时，使用受限 systemd 服务（专用系统账户、开机自启、失败重启、最小权限加固）；否则退化为 `setsid` + `nohup` 启动的独立后台进程，由脚本用 PID 文件（`/etc/cf-ssh-tunnel/tunnel.pid`，丢失时按命令行回退匹配）与日志文件（`/etc/cf-ssh-tunnel/tunnel.log`）管理。两种方式运行同一组 `cloudflared tunnel … run <UUID>` 参数与同一份 ingress 配置，仅进程隔离与凭据文件属组不同：systemd 模式为 `0640 root:cf-ssh-tunnel`，进程模式为 `0600 root:root`。进程模式不提供开机自启，这是无 init 系统环境的固有限制，脚本会在安装结束与帮助文本中明确说明。
+`cloudflared` 本身不依赖 systemd，systemd 只是本项目的托管手段之一。脚本同时支持两种托管方式：检测到 `systemctl` 且 `/run/systemd/system` 存在时，使用受限 systemd 服务（专用系统账户、开机自启、失败重启、最小权限加固）；否则退化为 `setsid` + `nohup` 启动的独立后台进程，由脚本用 PID 文件（`/etc/cf-ssh-tunnel/tunnel.pid`，丢失时按命令行回退匹配）与日志文件（`/etc/cf-ssh-tunnel/tunnel.log`）管理。两种方式运行同一组 `cloudflared tunnel … run <UUID>` 参数与同一份 ingress 配置，仅进程隔离与凭据文件属组不同：systemd 模式为 `0640 root:cf-ssh-tunnel`，进程模式为 `0600 root:root`。
+
+保活能力在两种模式下对齐：systemd 用 `Restart=on-failure` 与 `WantedBy=multi-user.target`；进程模式由看护脚本 `run.sh` 复刻同样的语义——`cloudflared` 异常退出后按 5 秒起步的退避间隔重启（上限 60 秒，避免崩溃循环刷日志），并在收到 `TERM` 时先结束子进程再退出，保证停止操作不会留下孤儿进程。无 init 系统没有"开机自启"这个概念，脚本改用 `/etc/profile.d/cf-ssh-tunnel-autostart.sh`（POSIX sh 兼容、幂等、非 root 登录时自动跳过）在首次登录 shell 时拉起，因此容器/实例重启后打开一次终端即可恢复 Tunnel；该钩子可通过 `autostart` 子命令查看与关闭，`uninstall` 会一并清理。
 
 ## 设计依据
 

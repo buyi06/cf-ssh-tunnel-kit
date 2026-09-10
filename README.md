@@ -60,21 +60,25 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 
 | 项目 | systemd 模式 | 进程模式（容器等） |
 |---|---|---|
-| 启动方式 | 受限 systemd 服务，开机自启 | `setsid` 独立后台进程，脱离终端会话 |
+| 启动方式 | 受限 systemd 服务，开机自启 | `setsid` 启动的看护进程 `run.sh`，脱离终端会话 |
 | 运行账户 | 专用 `cf-ssh-tunnel` 系统账户 | 当前 root |
 | 凭据权限 | `0640 root:cf-ssh-tunnel` | `0600 root:root` |
-| 运行状态 | `systemctl status` | PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid` |
+| 崩溃自愈 | `Restart=on-failure` | 看护进程自动重启 Tunnel（5 秒起、最长 60 秒） |
+| 重启后 | 开机自启 | 首次登录 shell 自动拉起，也可手动 `restart` |
+| 运行状态 | `systemctl status` | 看护进程 PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid` |
 | 日志 | `journalctl -u cf-ssh-tunnel` | `/etc/cf-ssh-tunnel/tunnel.log` |
-| 重启后 | 自动拉起 | **不会自动拉起**，需重新执行 `restart` |
 
 ```bash
-sudo bash start.sh                           # 一键：更新代码 + 拉起 Tunnel + 打印连接信息
-sudo bash scripts/cf-ssh-tunnel.sh restart   # 只重启 Tunnel 服务
-sudo bash scripts/cf-ssh-tunnel.sh logs      # 查看最近 80 行日志
-sudo bash scripts/cf-ssh-tunnel.sh status    # 显示托管方式、PID 与进程状态
+sudo bash start.sh                                  # 一键：更新代码 + 拉起 Tunnel + 打印连接信息
+sudo bash scripts/cf-ssh-tunnel.sh restart          # 只重启 Tunnel 服务
+sudo bash scripts/cf-ssh-tunnel.sh logs             # 查看最近 80 行日志
+sudo bash scripts/cf-ssh-tunnel.sh status           # 显示托管方式、PID 与进程状态
+sudo bash scripts/cf-ssh-tunnel.sh autostart --show # 查看登录自启状态
 ```
 
-> 进程模式同样是「一条命令装完就用」，但容器重建或重启后不会自启；把 `restart` 加进你所在平台的启动脚本即可。容器内还需先有监听 `22` 端口的 `sshd`，否则脚本会提示先安装启动 SSH。
+> **保活**：进程模式下 Tunnel 由看护脚本 `/etc/cf-ssh-tunnel/run.sh` 托管，异常退出会自动重启（间隔 5 秒起、最长 60 秒）；容器或机器重启后，任意一次登录 shell（例如打开终端）会把它自动拉起，也可以用 `restart` 手动拉起。不需要登录自启时执行 `autostart --disable`。
+>
+> 容器内还需先有监听 `22` 端口的 `sshd`，否则脚本会提示先安装启动 SSH。
 
 ## 必要前提
 
@@ -112,6 +116,7 @@ ssh root@ssh.example.com
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 cloudflared | `sudo bash scripts/cf-ssh-tunnel.sh update` |
+| 查看/开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
 | 输出客户端 SSH 配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
 | 删除本机服务与专用凭据 | `sudo bash scripts/cf-ssh-tunnel.sh uninstall` |
 

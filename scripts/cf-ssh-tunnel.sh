@@ -13,6 +13,8 @@ readonly META_FILE="${SERVICE_DIR}/tunnel.env"
 readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly PID_FILE="${SERVICE_DIR}/tunnel.pid"
 readonly LOG_FILE="${SERVICE_DIR}/tunnel.log"
+readonly RUNNER_SCRIPT="${SERVICE_DIR}/run.sh"
+readonly AUTOSTART_FILE='/etc/profile.d/cf-ssh-tunnel-autostart.sh'
 readonly EDGE_HOST_1='region1.v2.argotunnel.com'
 readonly EDGE_HOST_2='region2.v2.argotunnel.com'
 readonly GITHUB_PREFIX='https://github.com/'
@@ -80,6 +82,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh restart
   sudo bash cf-ssh-tunnel.sh diagnose
   sudo bash cf-ssh-tunnel.sh update
+  sudo bash cf-ssh-tunnel.sh autostart [--show|--enable|--disable]
   sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
   bash cf-ssh-tunnel.sh client-config [ssh.example.com] [用户名]
   sudo bash cf-ssh-tunnel.sh uninstall
@@ -100,14 +103,18 @@ usage() {
   restart        重启 Tunnel 服务，systemd 与进程模式都可用；容器重启后也用它重新拉起。
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
   update         使用系统包管理器更新 cloudflared。
+  autostart      查看或开关「登录自启」：无 systemd 的环境下，登录 shell 时自动拉起 Tunnel。
   github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
   client-config  输出可直接使用的 SSH 客户端配置（可选参数：域名、用户名）；不带参数时自动读取本机配置。
   uninstall      仅删除本机服务和凭据；不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。
 
 托管方式：
-  有正在运行的 systemd 时创建开机自启的受限 systemd 服务；容器、DSW/Colab、WSL 等没有 systemd 的
-  环境自动改用独立后台进程托管：PID 文件 /etc/cf-ssh-tunnel/tunnel.pid，日志 /etc/cf-ssh-tunnel/tunnel.log。
-  进程模式不会随系统或容器重启自动拉起，重启后请重新执行 restart。
+  有正在运行的 systemd 时创建开机自启的受限 systemd 服务，Tunnel 异常退出后自动重启（Restart=on-failure）；
+  容器、DSW/Colab、WSL 等没有 systemd 的环境自动改用后台看护进程，Tunnel 异常退出后自动重启
+  （间隔 5 秒起、最长 60 秒）；PID 文件 /etc/cf-ssh-tunnel/tunnel.pid，
+  日志 /etc/cf-ssh-tunnel/tunnel.log。
+  进程模式还会写入 /etc/profile.d/cf-ssh-tunnel-autostart.sh，让容器/机器重启后的首次登录 shell
+  自动拉起 Tunnel；用 autostart --disable 关闭，或 autostart --show 查看当前状态。
 
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
@@ -143,9 +150,8 @@ service_mode_label() {
 require_service_environment() {
   detect_service_mode
   if [[ "$SERVICE_MODE" == 'process' ]]; then
-    warn '未检测到正在运行的 systemd，将以「后台进程模式」托管 Tunnel（Docker 容器、DSW/Colab、WSL 等环境属于此类）。'
-    warn '该模式不会随系统或容器重启自动拉起；重启后请重新执行：sudo bash '"$0"' restart'
-    info "进程 PID 文件：${PID_FILE}，日志：${LOG_FILE}"
+    warn '未检测到正在运行的 systemd，将以「后台看护进程」托管 Tunnel（Docker 容器、DSW/Colab、WSL 等环境属于此类）。'
+    info "看护进程会在 Tunnel 异常退出后自动重启；PID 文件：${PID_FILE}，日志：${LOG_FILE}"
   fi
 }
 
@@ -772,25 +778,26 @@ EOF
   rm -f "$tmp"
 }
 
-process_is_cloudflared() {
+process_is_tunnel_service() {
   local pid="$1" cmdline=''
   [[ -r "/proc/${pid}/cmdline" ]] || return 0
   cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
-  [[ "$cmdline" == *'cloudflared'* ]]
+  # 进程模式下 PID 文件记录的是看护脚本；升级前启动的旧进程则直接是 cloudflared。
+  [[ "$cmdline" == *'cloudflared'* || "$cmdline" == *"$RUNNER_SCRIPT"* ]]
 }
 
 process_service_pid() {
   local pid=''
   if [[ -r "$PID_FILE" ]]; then
     read -r pid <"$PID_FILE" || true
-    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && process_is_cloudflared "$pid"; then
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && process_is_tunnel_service "$pid"; then
       printf '%s' "$pid"
       return 0
     fi
   fi
-  # PID 文件缺失或进程已被回收：按命令行回退匹配使用本配置的 cloudflared 进程。
+  # PID 文件缺失或进程已被回收：按命令行锚定到本项目的看护脚本，避免误伤只是提到配置路径的进程。
   if command -v pgrep >/dev/null 2>&1; then
-    pid="$(pgrep -f -- "--config ${CONFIG_FILE}" 2>/dev/null | head -n 1 || true)"
+    pid="$(pgrep -f -- "^[^ ]*(bash|sh) ${RUNNER_SCRIPT}\$" 2>/dev/null | head -n 1 || true)"
     if [[ "$pid" =~ ^[0-9]+$ ]]; then
       printf '%s' "$pid"
       return 0
@@ -799,24 +806,64 @@ process_service_pid() {
   return 1
 }
 
+write_process_runner() {
+  local tmp edge_ip_version='auto'
+  if [[ "$PROTOCOL" == 'http2' ]]; then
+    edge_ip_version='4'
+  fi
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+#!/usr/bin/env bash
+# 由 cf-ssh-tunnel-kit 自动生成（重新 install 会覆盖，请勿手工编辑）。
+# 作用：看护 Tunnel 进程，异常退出后自动重启；停止本进程即可结束 Tunnel。
+set -uo pipefail
+LOG='${LOG_FILE}'
+delay=5
+child=''
+stop() {
+  if [[ -n "\$child" ]]; then
+    kill "\$child" 2>/dev/null || true
+    wait "\$child" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap stop TERM INT
+while true; do
+  start="\$(date +%s)"
+  '${CF_BIN}' tunnel --no-autoupdate --config '${CONFIG_FILE}' --protocol '${PROTOCOL}' --edge-ip-version '${edge_ip_version}' --retries 5 run '${TUNNEL_UUID}' >>"\$LOG" 2>&1 &
+  child=\$!
+  wait "\$child"
+  code=\$?
+  elapsed=\$(( \$(date +%s) - start ))
+  printf '[看护] Tunnel 进程退出（退出码 %s，存活 %s 秒），%s 秒后重启\n' "\$code" "\$elapsed" "\$delay" >>"\$LOG"
+  sleep "\$delay"
+  if (( elapsed < 10 )); then
+    delay=\$(( delay * 2 ))
+    if (( delay > 60 )); then delay=60; fi
+  else
+    delay=5
+  fi
+done
+EOF
+  install -o root -g root -m 0755 "$tmp" "$RUNNER_SCRIPT"
+  rm -f "$tmp"
+}
+
 start_process_service() {
   local -a launcher=()
-  local edge_ip_version='auto'
   [[ -n "$CF_BIN" && -x "$CF_BIN" ]] || die '未找到 cloudflared 可执行文件，无法启动 Tunnel；请先执行 update。'
   if process_service_pid >/dev/null; then
     info 'Tunnel 进程已在运行，无需重复启动。'
     return 0
   fi
-  if [[ "$PROTOCOL" == 'http2' ]]; then
-    edge_ip_version='4'
-  fi
   install -d -o root -g root -m 0750 "$SERVICE_DIR"
-  # 与 systemd 单元保持同一组运行参数；setsid 让进程脱离当前终端会话，关掉终端不会带走 Tunnel。
+  [[ -r "$RUNNER_SCRIPT" ]] || write_process_runner
+  # 与 systemd 单元保持同一组运行参数；setsid 让看护进程脱离当前终端会话，关掉终端不会带走 Tunnel。
   command -v setsid >/dev/null 2>&1 && launcher=(setsid)
-  launcher+=(nohup "$CF_BIN" tunnel --no-autoupdate --config "$CONFIG_FILE" --protocol "$PROTOCOL" --edge-ip-version "$edge_ip_version" --retries 5 run "$TUNNEL_UUID")
+  launcher+=(nohup bash "$RUNNER_SCRIPT")
   "${launcher[@]}" </dev/null >>"$LOG_FILE" 2>&1 &
   printf '%s\n' "$!" >"$PID_FILE"
-  info "Tunnel 进程已启动（PID $!），日志：${LOG_FILE}"
+  info "Tunnel 看护进程已启动（PID $!），日志：${LOG_FILE}"
 }
 
 stop_process_service() {
@@ -825,6 +872,7 @@ stop_process_service() {
     rm -f "$PID_FILE"
     return 0
   fi
+  # 看护脚本收到 TERM 会先结束 cloudflared 子进程再退出，因此这里只需终止看护进程。
   kill "$pid" 2>/dev/null || true
   for ((i = 0; i < 10; i++)); do
     kill -0 "$pid" 2>/dev/null || break
@@ -836,6 +884,66 @@ stop_process_service() {
   fi
   rm -f "$PID_FILE"
   info 'Tunnel 进程已停止。'
+}
+
+install_autostart() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# 由 cf-ssh-tunnel-kit 写入：容器等无 systemd 环境下，登录 shell 时自动拉起 Tunnel。
+# 关闭方式：sudo bash <项目目录>/scripts/cf-ssh-tunnel.sh autostart --disable，或直接删除本文件。
+if [ -r ${RUNNER_SCRIPT} ] && [ -w ${SERVICE_DIR} ]; then
+  _cfkit_pid="\$(cat ${PID_FILE} 2>/dev/null || true)"
+  if [ -z "\$_cfkit_pid" ] || ! kill -0 "\$_cfkit_pid" 2>/dev/null; then
+    setsid nohup /bin/bash ${RUNNER_SCRIPT} >>${LOG_FILE} 2>&1 &
+    echo \$! >${PID_FILE} 2>/dev/null || true
+  fi
+  unset _cfkit_pid
+fi
+EOF
+  install -o root -g root -m 0644 "$tmp" "$AUTOSTART_FILE"
+  rm -f "$tmp"
+}
+
+show_autostart() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    say '当前托管方式：systemd 服务（开机自启由 systemd 负责，不使用登录钩子）。'
+  else
+    say '当前托管方式：后台看护进程（未检测到 systemd），崩溃后自动重启。'
+  fi
+  if [[ -r "$AUTOSTART_FILE" ]]; then
+    say "登录自启：已启用（${AUTOSTART_FILE}）"
+    say '容器或机器重启后，任意一次登录 shell（例如打开终端）都会自动拉起 Tunnel。'
+  else
+    say '登录自启：未启用'
+    say "启用方式：sudo bash $0 autostart --enable（重启后需手动 restart）"
+  fi
+}
+
+enable_autostart() {
+  if [[ "$SERVICE_MODE" != 'process' ]]; then
+    info 'systemd 模式已由 systemd 负责开机自启，无需登录钩子。'
+    return 0
+  fi
+  [[ -r "$RUNNER_SCRIPT" ]] || die '未找到看护脚本，请先重新执行 install。'
+  install_autostart
+  info "已启用登录自启：${AUTOSTART_FILE}（重启后首次登录 shell 自动拉起 Tunnel）。"
+}
+
+disable_autostart() {
+  rm -f "$AUTOSTART_FILE"
+  info '已关闭登录自启；当前正在运行的 Tunnel 不受影响。'
+}
+
+manage_autostart() {
+  require_root
+  detect_service_mode
+  case "${1:-}" in
+    ''|--show) show_autostart ;;
+    --enable) enable_autostart ;;
+    --disable) disable_autostart ;;
+    *) die 'autostart 仅支持 --show、--enable 或 --disable。' ;;
+  esac
 }
 
 wait_for_systemd_service() {
@@ -902,13 +1010,22 @@ install_service() {
   if [[ "$SERVICE_MODE" == 'systemd' ]]; then
     write_unit
     systemctl daemon-reload
+  else
+    write_process_runner
+    install_autostart
   fi
 }
 
 show_process_mode_notice() {
   say
-  warn '当前环境没有 systemd，Tunnel 以独立后台进程运行，不会随系统或容器重启自动拉起。'
-  say "重启后请重新执行：sudo bash $0 restart"
+  info '当前环境没有 systemd，Tunnel 由后台看护进程托管：异常退出后自动重启（间隔 5 秒起，最长 60 秒）。'
+  say "看护脚本：${RUNNER_SCRIPT}；运行日志：${LOG_FILE}"
+  if [[ -r "$AUTOSTART_FILE" ]]; then
+    say '已启用登录自启：容器或机器重启后，任意一次登录 shell（例如打开终端）都会自动拉起 Tunnel。'
+    say "如需关闭：sudo bash $0 autostart --disable"
+  else
+    warn '未启用登录自启：重启后需手动执行 restart 拉起 Tunnel。'
+  fi
   say "查看运行日志：sudo bash $0 logs"
 }
 
@@ -1202,6 +1319,8 @@ uninstall_tunnel() {
   if [[ "$SERVICE_MODE" == 'systemd' ]]; then
     rm -f "$UNIT_FILE"
     systemctl daemon-reload
+  else
+    rm -f "$AUTOSTART_FILE"
   fi
   rm -rf "$SERVICE_DIR"
   if id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -1222,6 +1341,7 @@ main() {
     restart) [[ $# -eq 0 ]] || die 'restart 不接受额外参数。'; restart_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
+    autostart) [[ $# -le 1 ]] || die 'autostart 最多接受一个选项。'; manage_autostart "${1:-}" ;;
     github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;
     client-config) [[ $# -le 2 ]] || die 'client-config 最多接受域名和用户名两个参数。'; client_config "${1:-}" "${2:-}" ;;
     uninstall) [[ $# -eq 0 ]] || die 'uninstall 不接受额外参数。'; uninstall_tunnel ;;
