@@ -1,6 +1,6 @@
 # 无显示器 Linux 的一键 Cloudflare SSH Tunnel
 
-> 本工具服务于没有显示器、只有命令行的 Linux 主机。它会自动检测或安装 `cloudflared`，在终端显示 Cloudflare 浏览器授权链接；授权完成后，只需要输入 SSH 域名，脚本便会自动创建 Tunnel、DNS CNAME 路由、`ssh://localhost:22` ingress 配置和 systemd 服务。
+> 本工具服务于没有显示器、只有命令行的 Linux 主机。它会自动检测或安装 `cloudflared`，在终端显示 Cloudflare 浏览器授权链接；授权完成后，只需要输入 SSH 域名，脚本便会自动创建 Tunnel、DNS CNAME 路由、`ssh://localhost:22` ingress 配置和托管服务（优先 systemd，容器等无 systemd 环境自动改用后台进程）。
 
 脚本位于 [`scripts/cf-ssh-tunnel.sh`](../scripts/cf-ssh-tunnel.sh)。它不会开放服务器的入站 `22` 端口，不会改动 `sshd_config`，也不会将 Tunnel 凭据写进命令行、日志或 Git 仓库。
 
@@ -10,7 +10,7 @@
 | 无显示器授权 | `cloudflared tunnel login` 在终端给出授权链接；可在任意手机或电脑浏览器打开完成授权。 |
 | Tunnel 与 DNS | 自动创建本地管理 Tunnel，并将用户输入的域名 CNAME 到 `<UUID>.cfargotunnel.com`。[1] |
 | SSH 服务路由 | 自动生成 `ssh://localhost:22` ingress 和最后的 `http_status:404` 兜底规则。[2] |
-| 开机运行 | 创建受限 systemd 服务，失败自动重启，服务进程仅可读取该 Tunnel 专用 JSON 凭据。 |
+| 开机运行 | 有 systemd 时创建受限 systemd 服务（失败自动重启，服务进程仅可读取该 Tunnel 专用 JSON 凭据）；没有 systemd 时以脱离终端会话的后台进程运行，由脚本管理 PID 与日志。 |
 | SSH 认证 | 继续使用服务器原有的 SSH 密钥或密码认证。 |
 | 中国大陆网络 | `--mainland` 强制 HTTP/2（TCP/7844），不依赖 UDP/QUIC；不能承诺任意网络均可用。 |
 
@@ -41,7 +41,7 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 ssh.example.com
 ```
 
-脚本会自动执行以下动作：创建唯一 Tunnel、创建域名 DNS 记录、生成仅指向本机 `localhost:22` 的 SSH 路由、校验配置并启动 systemd 服务。最后会显示实际使用的 SSH 域名和 Tunnel UUID。
+脚本会自动执行以下动作：创建唯一 Tunnel、创建域名 DNS 记录、生成仅指向本机 `localhost:22` 的 SSH 路由、校验配置并启动托管服务。最后会显示实际使用的 SSH 域名和 Tunnel UUID。
 
 > 授权期间产生的 `cert.pem` 具有账户级 Tunnel 管理能力。脚本仅在自动创建和 DNS 配置的短暂期间使用它，完成后立即清理；运行服务只保留此 Tunnel 的专用 JSON 凭据。[3]
 
@@ -57,7 +57,7 @@ Tunnel、DNS 和 SSH 路由在输入域名后即全部完成。客户端仍需�
 
 选中后，脚本通过 Git 全局 `url.<代理>https://github.com/.insteadOf` 规则加速当前管理员账户访问 `https://github.com/` 的 Git 克隆与拉取，并配套 `pushInsteadOf` 反向规则保证 `git push` 仍直连 GitHub。它**不会**设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会代理 apt 更新、Cloudflare 授权、Tunnel 连接或系统其他网络流量。
 
-对于未安装 `cloudflared` 的 Debian amd64 主机，`install --mainland` 也会从相同候选项中测试 Cloudflare 官方 GitHub Release `.deb` 文件的下载能力，并选择最快兼容项。下载前脚本通过 GitHub 官方 Release 页面取得版本与 SHA-256；下载后会验证 SHA-256 和 Debian 包结构，校验通过才交给 APT 安装。若元数据、代理下载、校验或安装失败，脚本自动回退到 Cloudflare 官方签名 APT 软件源。代理速度会随时间和线路变化，可随时重新测速：
+对于未安装 `cloudflared` 的 Debian amd64 主机，`install --mainland` 也会从相同候选项中测试 Cloudflare 官方 GitHub Release `.deb` 文件的下载能力，并选择最快兼容项。下载前脚本通过 GitHub 官方 Release 页面取得版本与 SHA-256；该页面直连超时时（大陆常见）会自动改用候选代理取回并解析。下载后会验证 SHA-256 和 Debian 包结构，校验通过才交给 APT 安装。若元数据、代理下载、校验或安装失败，脚本自动回退到 Cloudflare 官方签名 APT 软件源。代理速度会随时间和线路变化，可随时重新测速：
 
 ```bash
 sudo bash scripts/cf-ssh-tunnel.sh github-proxy
@@ -66,6 +66,38 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 ```
 
 > 这些是第三方 GitHub 加速服务。脚本只验证 Git 协议响应与延迟，不能把第三方代理变成代码来源信任锚。生产环境应固定经过审核的提交或发布版本，并审阅脚本后再以 root 执行。
+
+> 注意加速规则是在 `install --mainland` **运行之后**才写入的。第一次克隆本仓库时若直连 GitHub 超时，请改用加速地址克隆并把 `origin` 改回官方地址：
+>
+> ```bash
+> git clone https://gh-proxy.org/https://github.com/buyi06/cf-ssh-tunnel-kit.git
+> cd cf-ssh-tunnel-kit
+> git remote set-url origin https://github.com/buyi06/cf-ssh-tunnel-kit.git
+> ```
+
+## 容器等没有 systemd 的环境
+
+脚本不再要求必须存在 systemd。启动时它会检测 `systemctl` 与 `/run/systemd/system`：
+
+| 项目 | systemd 模式 | 进程模式（Docker 容器、DSW/Colab、WSL 等） |
+|---|---|---|
+| 启动方式 | `systemctl enable --now cf-ssh-tunnel` | `setsid nohup cloudflared … &`，脱离终端会话 |
+| 运行账户 | 专用 `cf-ssh-tunnel` 系统账户 | 当前 root |
+| 凭据与配置权限 | `0640 root:cf-ssh-tunnel` | `0600 root:root` |
+| 运行状态 | `systemctl status cf-ssh-tunnel` | PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid`（丢失时按命令行回退定位） |
+| 日志 | `journalctl -u cf-ssh-tunnel` | `/etc/cf-ssh-tunnel/tunnel.log` |
+| 系统/容器重启后 | 自动拉起 | **不会自动拉起**，需执行 `restart` |
+| SSH 检查 | 服务名 + 22 端口 | 22 端口监听或 `sshd` 进程 |
+
+因此容器里同样是一条命令装完即用：
+
+```bash
+sudo bash scripts/cf-ssh-tunnel.sh install --mainland
+sudo bash scripts/cf-ssh-tunnel.sh restart     # 容器重启后
+sudo bash scripts/cf-ssh-tunnel.sh logs
+```
+
+> 进程模式的 Tunnel 进程独立于当前终端，关掉终端或断开 SSH 不会中断，但容器重建、实例回收后一切都会丢失，需要重新执行 `install`（Tunnel 与 DNS 记录仍在 Cloudflare，重复执行会直接加载现有配置）。容器内必须先有监听 `22` 端口的 `sshd`，否则脚本会拒绝创建指向空服务的 Tunnel，并提示安装方式。
 
 ## 客户端连接
 
@@ -89,7 +121,9 @@ ssh root@ssh.example.com
 
 | 需求 | 命令 |
 |---|---|
-| 查看状态、Tunnel UUID、SSH 域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
+| 查看托管方式、状态、Tunnel UUID、SSH 域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
+| 重启 Tunnel（容器/机器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
+| 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和最近日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 `cloudflared` | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 输出客户端配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
@@ -107,7 +141,11 @@ ssh root@ssh.example.com
 
 **重复执行 install 会怎样？** 不会重复安装。脚本检测到已有配置时直接加载，显示现有 Tunnel 的域名、UUID、服务状态与连接命令；服务未运行会自动尝试拉起。想彻底重来，先执行 `uninstall`。
 
-**SSH 仍然连接失败。** 先运行 `diagnose`，确认 systemd 服务是 `active`，再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
+**SSH 仍然连接失败。** 先运行 `diagnose`，确认托管服务处于运行状态（systemd 模式看服务 `active`，进程模式看 PID 与日志尾部），再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
+
+**容器里提示「未检测到正在运行的 systemd」。** 这不是错误。脚本会自动改用后台进程模式继续安装，只是不会随容器重启自启；重启后执行 `sudo bash scripts/cf-ssh-tunnel.sh restart`。若提示未检测到 22 端口的 SSH 服务，请先在容器内启动 `sshd`，否则 Tunnel 没有可转发的目标。
+
+**`git clone` 报 `Failed to connect to github.com port 443`。** 这是本机到 GitHub 的网络问题，与脚本无关。改用加速地址克隆（见上文「中国大陆 GitHub 加速」），或在能连通 GitHub 的机器上克隆后拷贝目录过去。安装完成后脚本配置的 Git 加速会让后续 `git pull` 自动走代理。
 
 ## 参考资料
 

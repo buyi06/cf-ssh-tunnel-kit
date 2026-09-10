@@ -1,6 +1,10 @@
 # Cloudflare SSH Tunnel 设计依据
 
-本项目仅封装 Cloudflare 官方 `cloudflared` 客户端，不分发第三方二进制，也不提供绕过身份控制的裸 TCP/22 暴露方式。实现采用**本地管理 Tunnel**：脚本在无显示器服务器上调用 `cloudflared tunnel login`，由命令行输出浏览器授权链接；用户可在任意设备完成 Cloudflare 登录和站点选择，脚本随后自动创建 Tunnel、DNS 路由、SSH ingress 配置和 systemd 服务。
+本项目仅封装 Cloudflare 官方 `cloudflared` 客户端，不分发第三方二进制，也不提供绕过身份控制的裸 TCP/22 暴露方式。实现采用**本地管理 Tunnel**：脚本在无显示器服务器上调用 `cloudflared tunnel login`，由命令行输出浏览器授权链接；用户可在任意设备完成 Cloudflare 登录和站点选择，脚本随后自动创建 Tunnel、DNS 路由、SSH ingress 配置和托管服务。
+
+## 服务托管方式
+
+`cloudflared` 本身不依赖 systemd，systemd 只是本项目的托管手段之一。脚本同时支持两种托管方式：检测到 `systemctl` 且 `/run/systemd/system` 存在时，使用受限 systemd 服务（专用系统账户、开机自启、失败重启、最小权限加固）；否则退化为 `setsid` + `nohup` 启动的独立后台进程，由脚本用 PID 文件（`/etc/cf-ssh-tunnel/tunnel.pid`，丢失时按命令行回退匹配）与日志文件（`/etc/cf-ssh-tunnel/tunnel.log`）管理。两种方式运行同一组 `cloudflared tunnel … run <UUID>` 参数与同一份 ingress 配置，仅进程隔离与凭据文件属组不同：systemd 模式为 `0640 root:cf-ssh-tunnel`，进程模式为 `0600 root:root`。进程模式不提供开机自启，这是无 init 系统环境的固有限制，脚本会在安装结束与帮助文本中明确说明。
 
 ## 设计依据
 
@@ -10,7 +14,7 @@
 | Tunnel 创建 | `cloudflared tunnel create <name>` 建立 Tunnel，并生成该 Tunnel 的专用 JSON 凭据。[1] | 用域名派生出稳定、安全的 Tunnel 名称；服务只使用专用 JSON 凭据。 |
 | 自动 DNS | `cloudflared tunnel route dns <UUID 或名称> <hostname>` 可创建指向 `<UUID>.cfargotunnel.com` 的 CNAME。[1] | 用户只填写完整 SSH 域名；脚本自动创建 DNS 路由。 |
 | SSH ingress | Cloudflare 配置文件支持 `ssh://localhost:22`，且 ingress 规则必须以兜底规则结束。[2] | 自动写入单一 SSH 域名、`ssh://localhost:22` 与 `http_status:404`。 |
-| 账户级证书 | `cert.pem` 可管理账户下 Tunnel；Tunnel JSON 凭据只允许运行特定 Tunnel。[3] | 账户级证书仅存在于临时目录，创建与路由完成后删除；systemd 仅保存专用 JSON。 |
+| 账户级证书 | `cert.pem` 可管理账户下 Tunnel；Tunnel JSON 凭据只允许运行特定 Tunnel。[3] | 账户级证书仅存在于临时目录，创建与路由完成后删除；托管服务只保存专用 JSON。 |
 | Linux 安装 | Cloudflare 为 Debian/Ubuntu 和 RHEL 系提供签名软件源，也提供其他 Linux 安装方式。[5] | 先检测现有 `cloudflared` 并跳过安装；不存在时按发行版自动安装。 |
 | 运行网络 | Tunnel 需要到 Cloudflare 边缘的出站 `7844`；QUIC 使用 UDP，HTTP/2 使用 TCP。[6] | 安装前检查 DNS 与 TCP/7844；`--mainland` 固定 HTTP/2/TCP。 |
 

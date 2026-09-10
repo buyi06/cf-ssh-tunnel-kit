@@ -11,6 +11,8 @@ readonly SERVICE_DIR='/etc/cf-ssh-tunnel'
 readonly CONFIG_FILE="${SERVICE_DIR}/config.yml"
 readonly META_FILE="${SERVICE_DIR}/tunnel.env"
 readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly PID_FILE="${SERVICE_DIR}/tunnel.pid"
+readonly LOG_FILE="${SERVICE_DIR}/tunnel.log"
 readonly EDGE_HOST_1='region1.v2.argotunnel.com'
 readonly EDGE_HOST_2='region2.v2.argotunnel.com'
 readonly GITHUB_PREFIX='https://github.com/'
@@ -25,6 +27,13 @@ readonly -a GITHUB_PROXY_CANDIDATES=(
   'https://axisnow.gh-proxy.org/'
 )
 
+# 托管方式：优先 systemd；没有正在运行的 systemd（Docker 容器、DSW/Colab、WSL 等）时
+# 退化为独立后台进程，由脚本自己用 PID 文件管理。SYSTEMD_RUNTIME_DIR 可在测试中覆盖。
+SYSTEMD_RUNTIME_DIR='/run/systemd/system'
+SERVICE_MODE=''
+SERVICE_GROUP='root'
+CREDENTIAL_MODE='0600'
+RELEASE_PAGE_URL=''
 CF_BIN=''
 PACKAGE_MANAGER=''
 TUNNEL_UUID=''
@@ -67,6 +76,8 @@ usage() {
 用法：
   sudo bash cf-ssh-tunnel.sh install [--mainland|--auto|--quic]
   sudo bash cf-ssh-tunnel.sh status
+  sudo bash cf-ssh-tunnel.sh logs
+  sudo bash cf-ssh-tunnel.sh restart
   sudo bash cf-ssh-tunnel.sh diagnose
   sudo bash cf-ssh-tunnel.sh update
   sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
@@ -77,16 +88,23 @@ usage() {
   sudo bash cf-ssh-tunnel.sh install --mainland
 
 命令说明：
-  install        首次运行：自动安装 cloudflared、输出浏览器授权链接并创建 Tunnel、DNS 路由、SSH 配置和系统服务。本机已配置过时直接加载现有状态与连接方式，不会重复安装。
+  install        首次运行：自动安装 cloudflared、输出浏览器授权链接并创建 Tunnel、DNS 路由、SSH 配置和托管服务。本机已配置过时直接加载现有状态与连接方式，不会重复安装。
   --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络。
   --auto         先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2（默认）。
   --quic         固定使用 QUIC（UDP/7844）。
-  status         显示 Tunnel 名称、域名、服务状态和本机 SSH 状态。
+  status         显示 Tunnel 名称、域名、托管方式、进程状态和本机 SSH 状态。
+  logs           查看最近 80 行 Tunnel 日志：systemd 用 journalctl，进程模式读日志文件。
+  restart        重启 Tunnel 服务，systemd 与进程模式都可用；容器重启后也用它重新拉起。
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
   update         使用系统包管理器更新 cloudflared。
   github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
   client-config  输出可直接使用的 SSH 客户端配置（可选参数：域名、用户名）；不带参数时自动读取本机配置。
   uninstall      仅删除本机服务和凭据；不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。
+
+托管方式：
+  有正在运行的 systemd 时创建开机自启的受限 systemd 服务；容器、DSW/Colab、WSL 等没有 systemd 的
+  环境自动改用独立后台进程托管：PID 文件 /etc/cf-ssh-tunnel/tunnel.pid，日志 /etc/cf-ssh-tunnel/tunnel.log。
+  进程模式不会随系统或容器重启自动拉起，重启后请重新执行 restart。
 
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
@@ -99,9 +117,25 @@ require_root() {
   [[ "${EUID}" -eq 0 ]] || die "请以 root 运行，例如：sudo bash $0 install"
 }
 
-require_systemd() {
-  command -v systemctl >/dev/null 2>&1 || die '当前系统未检测到 systemctl；本脚本仅支持 systemd Linux。'
-  [[ -d /run/systemd/system ]] || die '当前环境不是正在运行的 systemd 系统，无法可靠托管 Tunnel 服务。'
+systemd_available() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUNTIME_DIR" ]]
+}
+
+detect_service_mode() {
+  if systemd_available; then
+    SERVICE_MODE='systemd'
+  else
+    SERVICE_MODE='process'
+  fi
+}
+
+require_service_environment() {
+  detect_service_mode
+  if [[ "$SERVICE_MODE" == 'process' ]]; then
+    warn '未检测到正在运行的 systemd，将以「后台进程模式」托管 Tunnel（Docker 容器、DSW/Colab、WSL 等环境属于此类）。'
+    warn '该模式不会随系统或容器重启自动拉起；重启后请重新执行：sudo bash '"$0"' restart'
+    info "进程 PID 文件：${PID_FILE}，日志：${LOG_FILE}"
+  fi
 }
 
 detect_package_manager() {
@@ -159,16 +193,33 @@ show_cloudflared_version() {
   info "已检测到 cloudflared，跳过安装：${output}"
 }
 
-get_cloudflared_release_metadata() {
-  local final_url tag digest tmp
-  tmp="$(mktemp)"
-  if ! final_url="$(curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
-    --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 \
-    --output "$tmp" --write-out '%{url_effective}' "$CLOUDFLARED_RELEASE_PAGE")"; then
+fetch_release_page() {
+  # 先直连 GitHub；连不通（大陆网络常见超时）时依次尝试候选代理。成功时输出页面临时文件路径。
+  local prefix tmp final_url
+  RELEASE_PAGE_URL=''
+  for prefix in '' "${GITHUB_PROXY_CANDIDATES[@]}"; do
+    tmp="$(mktemp)"
+    if final_url="$(curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+      --retry 2 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+      --output "$tmp" --write-out '%{url_effective}' "${prefix}${CLOUDFLARED_RELEASE_PAGE}" 2>/dev/null)"; then
+      RELEASE_PAGE_URL="$final_url"
+      printf '%s' "$tmp"
+      return 0
+    fi
     rm -f "$tmp"
-    return 1
+  done
+  return 1
+}
+
+get_cloudflared_release_metadata() {
+  local tmp tag digest
+  tmp="$(fetch_release_page || true)"
+  [[ -n "$tmp" ]] || return 1
+  tag="${RELEASE_PAGE_URL##*/}"
+  # 经代理取回时最终 URL 属于代理，改从页面 HTML 解析版本号。
+  if [[ ! "$tag" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+    tag="$(grep -Eo 'releases/tag/[0-9]{4}\.[0-9]+\.[0-9]+' "$tmp" | head -n 1 | sed 's#releases/tag/##' || true)"
   fi
-  tag="${final_url##*/}"
   digest="$(grep -Eio 'cloudflared-linux-amd64\.deb[^0-9a-f]{0,300}[0-9a-f]{64}' "$tmp" | head -n 1 | grep -Eio '[0-9a-f]{64}' | tr '[:upper:]' '[:lower:]' || true)"
   rm -f "$tmp"
   [[ "$tag" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]] || return 1
@@ -437,6 +488,18 @@ ensure_service_user() {
   fi
 }
 
+resolve_service_identity() {
+  # systemd 模式用受限账户运行并让该组只读凭据；进程模式（容器里通常是 root）保持 root 独占 0600。
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    ensure_service_user
+    SERVICE_GROUP="$SERVICE_USER"
+    CREDENTIAL_MODE='0640'
+  else
+    SERVICE_GROUP='root'
+    CREDENTIAL_MODE='0600'
+  fi
+}
+
 probe_dns() {
   local host="$1"
   if command -v getent >/dev/null 2>&1; then
@@ -485,19 +548,31 @@ check_network() {
 }
 
 check_local_ssh() {
-  local unit=''
-  if systemctl is-active --quiet ssh; then unit='ssh'; fi
-  if systemctl is-active --quiet sshd; then unit='sshd'; fi
-  if [[ -z "$unit" ]]; then
-    warn '未检测到运行中的 SSH 服务（ssh/sshd）。请先安装并启动 SSH。'
-    return 1
+  local unit='' listening=0
+  # systemd 只在可用时用于确认服务名；容器里 sshd 常由镜像直接拉起，故以端口/进程为准。
+  if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUNTIME_DIR" ]]; then
+    if systemctl is-active --quiet ssh; then unit='ssh'; fi
+    if systemctl is-active --quiet sshd; then unit='sshd'; fi
   fi
   if command -v ss >/dev/null 2>&1 && ss -lntH '( sport = :22 )' 2>/dev/null | grep -q .; then
-    info "本机 SSH 正在监听 22 端口（服务：${unit}）。"
-  else
-    warn 'SSH 服务已运行，但未能确认 22 端口监听；请确认 sshd 端口确为 22。'
+    listening=1
+  elif command -v pgrep >/dev/null 2>&1 && pgrep -x sshd >/dev/null 2>&1; then
+    listening=1
   fi
-  return 0
+  if (( listening == 1 )); then
+    if [[ -n "$unit" ]]; then
+      info "本机 SSH 正在监听 22 端口（服务：${unit}）。"
+    else
+      info '本机 SSH 正在监听 22 端口。'
+    fi
+    return 0
+  fi
+  if [[ -n "$unit" ]]; then
+    warn 'SSH 服务已运行，但未能确认 22 端口监听；请确认 sshd 端口确为 22。'
+    return 0
+  fi
+  warn '未检测到监听 22 端口的 SSH 服务（sshd）。请先安装并启动 SSH，例如容器内执行：apt-get install -y openssh-server && /usr/sbin/sshd'
+  return 1
 }
 
 validate_hostname() {
@@ -556,7 +631,7 @@ create_tunnel() {
   if ! output="$(HOME="$LOGIN_HOME" "$CF_BIN" tunnel --origincert "$CERT_FILE" create "$TUNNEL_NAME" 2>&1)"; then
     error "$output"
     if [[ "$output" =~ already[[:space:]]exists ]]; then
-      die "已存在同名 Tunnel：${TUNNEL_NAME}（通常是上次未完成的安装残留）。请执行 '$0 uninstall'，并到 Cloudflare Zero Trust 控制台（Networks → Tunnels）删除旧 Tunnel 后重试。"
+      die "已存在同名 Tunnel：${TUNNEL_NAME}（通常是上次未完成的安装残留，或容器重建后本机配置丢失）。请执行 '$0 uninstall'，并到 Cloudflare Zero Trust 控制台（Networks → Tunnels）删除旧 Tunnel 后重试。"
     fi
     die '创建 Tunnel 失败。请确认授权账号对该 Cloudflare 账户具有 Tunnel 管理权限。'
   fi
@@ -570,8 +645,8 @@ create_tunnel() {
   credential_source="${LOGIN_HOME}/.cloudflared/${TUNNEL_UUID}.json"
   [[ -s "$credential_source" ]] || die "未找到 Tunnel 凭据文件：${credential_source}"
 
-  install -d -o root -g "$SERVICE_USER" -m 0750 "$SERVICE_DIR"
-  install -o root -g "$SERVICE_USER" -m 0640 "$credential_source" "${SERVICE_DIR}/${TUNNEL_UUID}.json"
+  install -d -o root -g "$SERVICE_GROUP" -m 0750 "$SERVICE_DIR"
+  install -o root -g "$SERVICE_GROUP" -m "$CREDENTIAL_MODE" "$credential_source" "${SERVICE_DIR}/${TUNNEL_UUID}.json"
   info "Tunnel 已创建（UUID：${TUNNEL_UUID}）。"
 }
 
@@ -589,7 +664,7 @@ ingress:
     service: ssh://localhost:22
   - service: http_status:404
 EOF
-  install -o root -g "$SERVICE_USER" -m 0640 "$tmp" "$CONFIG_FILE"
+  install -o root -g "$SERVICE_GROUP" -m "$CREDENTIAL_MODE" "$tmp" "$CONFIG_FILE"
   rm -f "$tmp"
 
   if ! "$CF_BIN" tunnel --config "$CONFIG_FILE" ingress validate; then
@@ -686,7 +761,73 @@ EOF
   rm -f "$tmp"
 }
 
-wait_for_service() {
+process_is_cloudflared() {
+  local pid="$1" cmdline=''
+  [[ -r "/proc/${pid}/cmdline" ]] || return 0
+  cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+  [[ "$cmdline" == *'cloudflared'* ]]
+}
+
+process_service_pid() {
+  local pid=''
+  if [[ -r "$PID_FILE" ]]; then
+    read -r pid <"$PID_FILE" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && process_is_cloudflared "$pid"; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  # PID 文件缺失或进程已被回收：按命令行回退匹配使用本配置的 cloudflared 进程。
+  if command -v pgrep >/dev/null 2>&1; then
+    pid="$(pgrep -f -- "--config ${CONFIG_FILE}" 2>/dev/null | head -n 1 || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+start_process_service() {
+  local -a launcher=()
+  local edge_ip_version='auto'
+  [[ -n "$CF_BIN" && -x "$CF_BIN" ]] || die '未找到 cloudflared 可执行文件，无法启动 Tunnel；请先执行 update。'
+  if process_service_pid >/dev/null; then
+    info 'Tunnel 进程已在运行，无需重复启动。'
+    return 0
+  fi
+  if [[ "$PROTOCOL" == 'http2' ]]; then
+    edge_ip_version='4'
+  fi
+  install -d -o root -g root -m 0750 "$SERVICE_DIR"
+  # 与 systemd 单元保持同一组运行参数；setsid 让进程脱离当前终端会话，关掉终端不会带走 Tunnel。
+  command -v setsid >/dev/null 2>&1 && launcher=(setsid)
+  launcher+=(nohup "$CF_BIN" tunnel --no-autoupdate --config "$CONFIG_FILE" --protocol "$PROTOCOL" --edge-ip-version "$edge_ip_version" --retries 5 run "$TUNNEL_UUID")
+  "${launcher[@]}" </dev/null >>"$LOG_FILE" 2>&1 &
+  printf '%s\n' "$!" >"$PID_FILE"
+  info "Tunnel 进程已启动（PID $!），日志：${LOG_FILE}"
+}
+
+stop_process_service() {
+  local pid='' i
+  if ! pid="$(process_service_pid)"; then
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  for ((i = 0; i < 10; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "Tunnel 进程未在 10 秒内退出，将强制结束（PID ${pid}）。"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  info 'Tunnel 进程已停止。'
+}
+
+wait_for_systemd_service() {
   local i
   for ((i = 0; i < 15; i++)); do
     if systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -698,6 +839,92 @@ wait_for_service() {
   error '服务未能在 15 秒内启动，以下为最近日志：'
   journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
   die 'Tunnel 服务启动失败。请执行 diagnose 查看网络和日志。'
+}
+
+wait_for_process_service() {
+  local i pid
+  for ((i = 0; i < 15; i++)); do
+    if pid="$(process_service_pid)"; then
+      info "Tunnel 进程运行中（PID ${pid}）。"
+      return 0
+    fi
+    sleep 1
+  done
+  error 'Tunnel 进程未能在 15 秒内启动，以下为最近日志：'
+  tail -n 60 "$LOG_FILE" 2>/dev/null || true
+  die 'Tunnel 服务启动失败。请执行 diagnose 查看网络和日志。'
+}
+
+wait_for_service() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    wait_for_systemd_service
+  else
+    wait_for_process_service
+  fi
+}
+
+service_is_active() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    systemctl is-active --quiet "$SERVICE_NAME"
+  else
+    process_service_pid >/dev/null
+  fi
+}
+
+start_tunnel_service() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  else
+    start_process_service
+  fi
+}
+
+stop_tunnel_service() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  else
+    stop_process_service
+  fi
+}
+
+install_service() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    write_unit
+    systemctl daemon-reload
+  fi
+}
+
+show_process_mode_notice() {
+  say
+  warn '当前环境没有 systemd，Tunnel 以独立后台进程运行，不会随系统或容器重启自动拉起。'
+  say "重启后请重新执行：sudo bash $0 restart"
+  say "查看运行日志：sudo bash $0 logs"
+}
+
+restart_tunnel() {
+  require_root
+  detect_service_mode
+  read_metadata || die "未发现本机 Tunnel 配置（${META_FILE}）。请先执行 install。"
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    systemctl restart "$SERVICE_NAME"
+  else
+    find_cloudflared || die '未找到 cloudflared，无法重启 Tunnel；请先执行 update。'
+    stop_process_service
+    start_process_service
+  fi
+  wait_for_service
+  info 'Tunnel 服务已重启。'
+}
+
+show_tunnel_logs() {
+  require_root
+  detect_service_mode
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
+  else
+    [[ -r "$LOG_FILE" ]] || die "未找到日志文件 ${LOG_FILE}；进程模式尚未启动过 Tunnel。"
+    tail -n 80 "$LOG_FILE"
+  fi
 }
 
 print_connection_info() {
@@ -736,7 +963,7 @@ show_mainland_notice() {
 }
 
 load_existing_install() {
-  if [[ ! -e "$UNIT_FILE" ]]; then
+  if [[ "$SERVICE_MODE" == 'systemd' && ! -e "$UNIT_FILE" ]]; then
     die "检测到残留配置但缺少 systemd 服务文件（可能是上次未完成的安装）。请执行 'sudo bash $0 uninstall' 清理后重新 install。"
   fi
   if ! read_metadata; then
@@ -749,12 +976,15 @@ load_existing_install() {
   say "SSH 域名：${PUBLIC_HOSTNAME}"
   say "传输协议：${PROTOCOL}"
   say
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
+  if service_is_active; then
     info 'Tunnel 服务正在运行，无需重新安装。'
   else
     warn 'Tunnel 服务未在运行，正在尝试启动……'
-    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if [[ "$SERVICE_MODE" == 'process' ]]; then
+      find_cloudflared || die "未找到 cloudflared，无法以进程模式启动 Tunnel。请执行 'sudo bash $0 update' 重新安装。"
+    fi
+    start_tunnel_service
+    if service_is_active; then
       info '服务已重新启动，运行正常。'
     else
       die "服务启动失败。请执行 '$0 diagnose' 排查网络与服务日志。"
@@ -780,7 +1010,7 @@ install_tunnel() {
   done
 
   require_root
-  require_systemd
+  require_service_environment
   if [[ -e "$UNIT_FILE" || -e "$META_FILE" || -e "$SERVICE_DIR" ]]; then
     load_existing_install
     return 0
@@ -788,7 +1018,7 @@ install_tunnel() {
   ensure_cloudflared
   check_network
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
-  ensure_service_user
+  resolve_service_identity
   INSTALL_USER="${SUDO_USER:-$(id -un)}"
   if [[ "$PROTOCOL" == 'http2' ]]; then
     show_mainland_notice
@@ -801,16 +1031,22 @@ install_tunnel() {
   write_config
   create_dns_route
   write_metadata
-  write_unit
-  systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  install_service
+  start_tunnel_service
   wait_for_service
   show_connection_notice
+  if [[ "$SERVICE_MODE" == 'process' ]]; then
+    show_process_mode_notice
+  fi
 }
 
 status_tunnel() {
+  local service_mode_text='后台进程（未检测到 systemd）' pid=''
   require_root
-  require_systemd
+  detect_service_mode
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    service_mode_text='systemd 服务'
+  fi
   if ! read_metadata; then
     warn "未发现 ${SERVICE_NAME} 的本地配置。"
     return 1
@@ -824,16 +1060,26 @@ status_tunnel() {
   say "Tunnel UUID：${TUNNEL_UUID}"
   say "SSH 域名：${PUBLIC_HOSTNAME}"
   say "传输协议：${PROTOCOL}"
+  say "托管方式：${service_mode_text}"
   say "凭据文件权限：$(stat -c '%a %U:%G %n' "${SERVICE_DIR}/${TUNNEL_UUID}.json" 2>/dev/null || echo '文件缺失')"
   say
-  systemctl --no-pager --full status "$SERVICE_NAME" || true
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    systemctl --no-pager --full status "$SERVICE_NAME" || true
+  else
+    if pid="$(process_service_pid)"; then
+      info "Tunnel 进程运行中（PID ${pid}），日志：${LOG_FILE}"
+      tail -n 20 "$LOG_FILE" 2>/dev/null || true
+    else
+      warn 'Tunnel 进程未在运行。可执行 restart 重新拉起。'
+    fi
+  fi
   say
   check_local_ssh || true
 }
 
 diagnose_tunnel() {
   require_root
-  require_systemd
+  detect_service_mode
   say '== Cloudflare DNS 预检 =='
   if probe_dns "$EDGE_HOST_1"; then info "DNS 正常：${EDGE_HOST_1}"; else warn "DNS 异常：${EDGE_HOST_1}"; fi
   if probe_dns "$EDGE_HOST_2"; then info "DNS 正常：${EDGE_HOST_2}"; else warn "DNS 异常：${EDGE_HOST_2}"; fi
@@ -854,11 +1100,25 @@ diagnose_tunnel() {
   fi
   say
   say '== 服务状态与日志 =='
-  if [[ -e "$UNIT_FILE" ]]; then
-    systemctl --no-pager --full status "$SERVICE_NAME" || true
-    journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    if [[ -e "$UNIT_FILE" ]]; then
+      systemctl --no-pager --full status "$SERVICE_NAME" || true
+      journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
+    else
+      warn "未安装 ${SERVICE_NAME} 服务。"
+    fi
   else
-    warn "未安装 ${SERVICE_NAME} 服务。"
+    local pid=''
+    if pid="$(process_service_pid)"; then
+      info "Tunnel 进程运行中（PID ${pid}）。"
+    else
+      warn 'Tunnel 进程未在运行。可执行 restart 重新拉起。'
+    fi
+    if [[ -r "$LOG_FILE" ]]; then
+      tail -n 80 "$LOG_FILE"
+    else
+      warn "未找到日志文件 ${LOG_FILE}。"
+    fi
   fi
 }
 
@@ -885,7 +1145,8 @@ update_cloudflared() {
   esac
   find_cloudflared || die 'cloudflared 更新后不可用。'
   info "更新完成：$($CF_BIN --version 2>&1)"
-  info "如需立即加载新版本，请执行：systemctl restart ${SERVICE_NAME}"
+  # restart 会按当前托管方式（systemd 或后台进程）自动选择重启方式。
+  info "如需立即加载新版本，请执行：sudo bash $0 restart"
 }
 
 client_config() {
@@ -916,22 +1177,24 @@ EOF
 
 uninstall_tunnel() {
   require_root
-  require_systemd
+  detect_service_mode
   [[ -e "$UNIT_FILE" || -e "$SERVICE_DIR" ]] || die '未发现本脚本创建的本地配置。'
   local old_uuid=''
   if read_metadata; then old_uuid="$TUNNEL_UUID"; fi
-  say '该操作将停止并删除本机 systemd 服务、配置和 Tunnel 专用凭据。'
+  say '该操作将停止并删除本机托管服务、配置和 Tunnel 专用凭据。'
   say '为避免账户级误删，它不会删除 Cloudflare 控制台中的 Tunnel 或 DNS 记录。'
-  [[ -n "$old_uuid" ]] && say "如不再使用，请在 Cloudflare 控制台删除 Tunnel：${old_uuid}"
+  if [[ -n "$old_uuid" ]]; then say "如不再使用，请在 Cloudflare 控制台删除 Tunnel：${old_uuid}"; fi
   local answer=''
   if ! read -r -p '若确认，请输入 DELETE：' answer; then
     die '未读取到确认输入，已取消。'
   fi
   [[ "$answer" == 'DELETE' ]] || die '已取消。'
-  systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
-  rm -f "$UNIT_FILE"
+  stop_tunnel_service
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload
+  fi
   rm -rf "$SERVICE_DIR"
-  systemctl daemon-reload
   if id "$SERVICE_USER" >/dev/null 2>&1; then
     if command -v userdel >/dev/null 2>&1; then userdel "$SERVICE_USER" 2>/dev/null || true
     elif command -v deluser >/dev/null 2>&1; then deluser "$SERVICE_USER" 2>/dev/null || true
@@ -946,6 +1209,8 @@ main() {
   case "$command" in
     install) install_tunnel "$@" ;;
     status) [[ $# -eq 0 ]] || die 'status 不接受额外参数。'; status_tunnel ;;
+    logs) [[ $# -eq 0 ]] || die 'logs 不接受额外参数。'; show_tunnel_logs ;;
+    restart) [[ $# -eq 0 ]] || die 'restart 不接受额外参数。'; restart_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
     github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;

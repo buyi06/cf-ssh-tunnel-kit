@@ -40,6 +40,11 @@ assert_contains "$help_output" '不会重复安装' '帮助文本说明重复安
 assert_contains "$help_output" '本脚本不会开放服务器入站端口' '帮助文本声明安全边界'
 assert_contains "$help_output" 'github-proxy [--show|--disable]' '帮助文本包含 GitHub 代理管理命令'
 assert_contains "$help_output" 'GitHub 代理仅影响 Git 的 github.com 克隆与拉取' '帮助文本限制代理影响范围'
+assert_contains "$help_output" 'restart        重启 Tunnel 服务' '帮助文本包含 restart 命令'
+assert_contains "$help_output" 'logs           查看最近 80 行 Tunnel 日志' '帮助文本包含 logs 命令'
+assert_contains "$help_output" '改用独立后台进程托管' '帮助文本说明非 systemd 托管方式'
+assert_contains "$help_output" '容器、DSW/Colab、WSL 等没有 systemd 的' '帮助文本点名无 systemd 的典型环境'
+assert_contains "$help_output" '/etc/cf-ssh-tunnel/tunnel.log' '帮助文本给出进程模式日志路径'
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
 assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Tunnel ProxyCommand'
@@ -79,6 +84,33 @@ pass '毫秒换算行为正确（.5 -> 500）'
 [[ "$(seconds_to_milliseconds '12')" == '12000' ]] || fail '毫秒换算错误：12 应为 12000'
 pass '毫秒换算行为正确（12 -> 12000）'
 
+# 行为测试：托管方式检测——没有正在运行的 systemd 时退化为后台进程模式
+mode_stub_dir="$(mktemp -d)"
+printf '#!/bin/sh\nexit 0\n' >"${mode_stub_dir}/systemctl"
+chmod +x "${mode_stub_dir}/systemctl"
+mkdir -p "${mode_stub_dir}/run-systemd"
+mode_old_path="$PATH"
+mode_old_runtime="$SYSTEMD_RUNTIME_DIR"
+# 探测期间只暴露桩目录，避免命中宿主机上真实的 systemctl。
+PATH="${mode_stub_dir}"
+SYSTEMD_RUNTIME_DIR="${mode_stub_dir}/no-systemd"
+detect_service_mode
+[[ "$SERVICE_MODE" == 'process' ]] || fail '没有 systemd 运行目录时应选择后台进程模式'
+pass '没有 systemd 运行目录时选择后台进程模式'
+SYSTEMD_RUNTIME_DIR="${mode_stub_dir}/run-systemd"
+detect_service_mode
+[[ "$SERVICE_MODE" == 'systemd' ]] || fail 'systemctl 与运行目录都在时应选择 systemd'
+pass 'systemd 可用时优先选择 systemd 服务'
+PATH="$mode_old_path"
+rm -f "${mode_stub_dir}/systemctl"
+PATH="${mode_stub_dir}"
+detect_service_mode
+[[ "$SERVICE_MODE" == 'process' ]] || fail '缺少 systemctl 命令时应选择后台进程模式'
+pass '缺少 systemctl 命令时选择后台进程模式'
+PATH="$mode_old_path"
+SYSTEMD_RUNTIME_DIR="$mode_old_runtime"
+rm -rf "$mode_stub_dir"
+
 # 行为测试：同一域名生成确定的 Tunnel 名称
 # shellcheck disable=SC2034  # 由 source 进来的 make_tunnel_name 读取
 PUBLIC_HOSTNAME='ssh.example.com'
@@ -107,7 +139,8 @@ if command -v git >/dev/null 2>&1; then
   pass '代理清理同时移除 insteadOf 与 pushInsteadOf 规则'
 fi
 
-script_text="$(cat "$SCRIPT")"
+# 去掉 CR：Windows 上 core.autocrlf=true 的工作区是 CRLF，跨行断言不应因此失效。
+script_text="$(tr -d '\r' <"$SCRIPT")"
 assert_contains "$script_text" 'ensure_cloudflared()' '包含 cloudflared 自动检测函数'
 assert_contains "$script_text" "info '未安装 cloudflared，开始自动安装。'" '未安装时触发自动安装'
 assert_contains "$script_text" "\"\$CF_BIN\" tunnel login" '包含 Cloudflare 浏览器授权命令'
@@ -160,5 +193,28 @@ assert_contains "$script_text" "ssh -o ProxyCommand='cloudflared access ssh --ho
 assert_contains "$script_text" "trap 'cleanup_login_certificate; exit 130' INT" 'Ctrl-C 中断也清理授权证书'
 assert_contains "$script_text" "\"\$PROTOCOL\" == 'http2'" '仅中国大陆模式尝试代理下载'
 assert_contains "$script_text" "rm -rf \"\$LOGIN_HOME\"" '授权后的账户级证书会被清理'
+assert_not_contains "$script_text" 'require_systemd' '不再硬性拒绝非 systemd 环境'
+assert_not_contains "$script_text" '本脚本仅支持 systemd Linux' '不再声明仅支持 systemd'
+assert_contains "$script_text" 'detect_service_mode' '自动检测托管方式'
+assert_contains "$script_text" "readonly PID_FILE=\"\${SERVICE_DIR}/tunnel.pid\"" '进程模式使用独立 PID 文件'
+assert_contains "$script_text" "readonly LOG_FILE=\"\${SERVICE_DIR}/tunnel.log\"" '进程模式写独立日志文件'
+assert_contains "$script_text" 'start_process_service' '包含进程模式启动函数'
+assert_contains "$script_text" 'stop_process_service' '包含进程模式停止函数'
+assert_contains "$script_text" 'wait_for_process_service' '进程模式有启动等待'
+assert_contains "$script_text" 'setsid' '进程模式脱离终端会话'
+assert_contains "$script_text" 'nohup' '进程模式忽略挂断信号'
+assert_contains "$script_text" 'process_is_cloudflared' '启动前校验 PID 确属 cloudflared'
+assert_contains "$script_text" 'pgrep -f -- "--config ${CONFIG_FILE}"' 'PID 文件丢失时按命令行回退定位进程'
+assert_contains "$script_text" 'resolve_service_identity' '按托管方式决定服务账户与凭据权限'
+assert_contains "$script_text" "SERVICE_GROUP=\"\$SERVICE_USER\"" 'systemd 模式凭据归受限服务组'
+assert_contains "$script_text" 'CREDENTIAL_MODE' '进程模式以 0600 独占凭据'
+assert_contains "$script_text" 'show_process_mode_notice' '进程模式提示不会随重启自动拉起'
+assert_contains "$script_text" "  if [[ \"\$SERVICE_MODE\" == 'process' ]]; then
+    show_process_mode_notice" '安装结束提示仅在进程模式出现'
+assert_contains "$script_text" 'apt-get install -y openssh-server' '容器内缺少 sshd 时给出启动提示'
+assert_contains "$script_text" 'fetch_release_page' 'Release 元数据支持经代理回退'
+assert_contains "$script_text" 'releases/tag/[0-9]{4}' '经代理取回时从页面解析版本号'
+assert_contains "$script_text" 'restart_tunnel' '提供 restart 子命令'
+assert_contains "$script_text" 'show_tunnel_logs' '提供 logs 子命令'
 
 printf '所有 %d 项无网络回归测试通过。\n' "$pass_count"

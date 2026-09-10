@@ -1,8 +1,8 @@
 # cf-ssh-tunnel-kit
 
-> **无显示器 Linux 的全中文 Cloudflare SSH Tunnel 一键部署工具。** 执行一条命令，自动安装 `cloudflared`（已安装则跳过）、终端显示浏览器授权链接、填写域名后自动创建 Tunnel、DNS 路由、SSH 配置和 systemd 服务。
+> **无显示器 Linux 的全中文 Cloudflare SSH Tunnel 一键部署工具。** 执行一条命令，自动安装 `cloudflared`（已安装则跳过）、终端显示浏览器授权链接、填写域名后自动创建 Tunnel、DNS 路由、SSH 配置和托管服务：有正在运行的 systemd 时创建 systemd 服务，Docker 容器、DSW/Colab、WSL 等没有 systemd 的环境自动改用独立后台进程。
 
-它适合家用 Linux、小主机、NAS、树莓派和没有公网入站 IP 的云服务器。脚本只把 Cloudflare Tunnel 接到本机 `ssh://localhost:22`，不会开放服务器入站 `22` 端口，不改动 `sshd_config`，也不创建裸 TCP SSH 公网转发。
+它适合家用 Linux、小主机、NAS、树莓派、没有公网入站 IP 的云服务器，以及 ModelScope DSW 这类只有容器的开发环境。脚本只把 Cloudflare Tunnel 接到本机 `ssh://localhost:22`，不会开放服务器入站 `22` 端口，不改动 `sshd_config`，也不创建裸 TCP SSH 公网转发。
 
 ## 一条命令开始
 
@@ -15,13 +15,24 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 
 > 这四行可以整段重复粘贴执行：目录已存在时跳过克隆，`git pull` 更新到最新版，`install` 检测到本机已配置过时直接显示现有 Tunnel 状态和连接命令，**不会重复安装**。
 
+中国大陆直连 `github.com` 超时（出现 `Failed to connect to github.com port 443`）时，第一次克隆改用加速地址，并把 `origin` 改回官方地址：
+
+```bash
+git clone https://gh-proxy.org/https://github.com/buyi06/cf-ssh-tunnel-kit.git
+cd cf-ssh-tunnel-kit
+git remote set-url origin https://github.com/buyi06/cf-ssh-tunnel-kit.git
+sudo bash scripts/cf-ssh-tunnel.sh install --mainland
+```
+
+> `install --mainland` 会自动测速并配置 Git 加速，因此**安装之后**的 `git pull` 才会走代理；安装前的那次 `git pull` 仍然可能超时，可跳过。
+
 执行后，脚本会按中文提示完成以下流程：
 
 | 步骤 | 你需要做什么 | 脚本自动完成什么 |
 |---|---|---|
 | 1. 检查环境 | 无需操作。 | 检查本机 SSH、DNS、Cloudflare TCP/7844；检测 `cloudflared`，未安装时自动安装。 |
 | 2. Cloudflare 授权 | 复制终端显示的 `https://...` 链接，在任意浏览器打开并选择站点。 | 等待授权成功，不需要服务器显示器。 |
-| 3. 填写域名 | 输入完整域名，例如 `ssh.example.com`。 | 创建 Tunnel、自动写 DNS CNAME、生成 `ssh://localhost:22` ingress、校验配置、启动 systemd 服务。 |
+| 3. 填写域名 | 输入完整域名，例如 `ssh.example.com`。 | 创建 Tunnel、自动写 DNS CNAME、生成 `ssh://localhost:22` ingress、校验配置、启动托管服务。 |
 | 4. 直接连接 | 无需额外控制台设置。 | 输出客户端 SSH 配置模板；继续使用服务器原有的 SSH 密钥或密码认证。 |
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
@@ -34,6 +45,27 @@ sudo bash scripts/cf-ssh-tunnel.sh install --mainland
 sudo bash scripts/cf-ssh-tunnel.sh github-proxy
 sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 ```
+
+## 没有 systemd 的环境（容器 / DSW / Colab / WSL）
+
+脚本不需要 systemd。检测不到正在运行的 systemd 时，它会自动改用**后台进程模式**托管 Tunnel：
+
+| 项目 | systemd 模式 | 进程模式（容器等） |
+|---|---|---|
+| 启动方式 | 受限 systemd 服务，开机自启 | `setsid` 独立后台进程，脱离终端会话 |
+| 运行账户 | 专用 `cf-ssh-tunnel` 系统账户 | 当前 root |
+| 凭据权限 | `0640 root:cf-ssh-tunnel` | `0600 root:root` |
+| 运行状态 | `systemctl status` | PID 文件 `/etc/cf-ssh-tunnel/tunnel.pid` |
+| 日志 | `journalctl -u cf-ssh-tunnel` | `/etc/cf-ssh-tunnel/tunnel.log` |
+| 重启后 | 自动拉起 | **不会自动拉起**，需重新执行 `restart` |
+
+```bash
+sudo bash scripts/cf-ssh-tunnel.sh restart   # 容器/机器重启后重新拉起
+sudo bash scripts/cf-ssh-tunnel.sh logs      # 查看最近 80 行日志
+sudo bash scripts/cf-ssh-tunnel.sh status    # 显示托管方式、PID 与进程状态
+```
+
+> 进程模式同样是「一条命令装完就用」，但容器重建或重启后不会自启；把 `restart` 加进你所在平台的启动脚本即可。容器内还需先有监听 `22` 端口的 `sshd`，否则脚本会提示先安装启动 SSH。
 
 ## 必要前提
 
@@ -65,7 +97,9 @@ ssh root@ssh.example.com
 
 | 用途 | 命令 |
 |---|---|
-| 查看服务、Tunnel UUID 与域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
+| 查看托管方式、服务状态、Tunnel UUID 与域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
+| 重启 Tunnel（容器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
+| 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 cloudflared | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 输出客户端 SSH 配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
