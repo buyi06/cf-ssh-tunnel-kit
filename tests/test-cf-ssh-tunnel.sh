@@ -50,6 +50,9 @@ assert_contains "$help_output" '容器、DSW/Colab、WSL 等没有 systemd 的' 
 assert_contains "$help_output" '/etc/cf-ssh-tunnel/tunnel.log' '帮助文本给出进程模式日志路径'
 assert_contains "$help_output" 'sudo bash start.sh' '帮助文本指向一键启动脚本'
 assert_contains "$help_output" 'autostart [--show|--enable|--disable]' '帮助文本包含登录自启命令'
+assert_contains "$help_output" 'credentials [--set-password]' '帮助文本包含登录信息命令'
+assert_contains "$help_output" '--no-password' '帮助文本包含关闭设密选项'
+assert_contains "$help_output" '生成一个随机密码写入本机 /etc/shadow' '安全说明交代密码设置行为'
 assert_contains "$help_output" '异常退出后自动重启' '帮助文本说明看护进程会自愈'
 
 start_help="$(bash "$START_SCRIPT" --help)"
@@ -130,6 +133,33 @@ pass '缺少 systemctl 命令时选择后台进程模式'
 PATH="$mode_old_path"
 SYSTEMD_RUNTIME_DIR="$mode_old_runtime"
 rm -rf "$mode_stub_dir"
+
+# 行为测试：随机登录密码
+login_password="$(generate_password)"
+[[ "${#login_password}" -eq 16 ]] || fail "随机密码长度应为 16，实际 ${#login_password}"
+pass '随机登录密码长度为 16'
+[[ "$login_password" =~ ^[A-Za-z0-9]+$ ]] || fail '随机密码应只含字母数字，便于手输'
+pass '随机登录密码只含字母数字'
+[[ "$(generate_password)" != "$login_password" ]] || fail '两次生成的密码不应相同'
+pass '随机登录密码每次不同'
+
+# 行为测试：authorized_keys 解析（忽略注释、空行与非法行）
+keys_file="$(mktemp)"
+printf '# 注释行\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYONLY test@host\nnot-a-key\nssh-rsa AAAAB3NzaC1yc2EAAAATESTONLY rsa@host\n' >"$keys_file"
+parsed_keys="$(authorized_key_lines "$keys_file" | grep -c . || true)"
+[[ "$parsed_keys" -eq 2 ]] || fail "应解析出 2 个公钥，实际 ${parsed_keys}"
+pass 'authorized_keys 解析忽略注释与非法行'
+[[ -z "$(authorized_key_lines "${keys_file}.missing")" ]] || fail '缺失的 authorized_keys 应返回空'
+pass '缺失的 authorized_keys 返回空'
+rm -f "$keys_file"
+
+if user_has_password 'cf-ssh-tunnel-no-such-user'; then
+  fail '不存在的账户不应判定为有可用密码'
+fi
+pass '不存在的账户判定为无可用密码'
+
+[[ -n "$(login_user_home root)" ]] || fail '应能解析 root 的家目录'
+pass '解析登录用户家目录'
 
 # 行为测试：同一域名生成确定的 Tunnel 名称
 # shellcheck disable=SC2034  # 由 source 进来的 make_tunnel_name 读取
@@ -248,6 +278,19 @@ assert_contains "$script_text" 'releases/tag/[0-9]{4}' '经代理取回时从页
 assert_contains "$script_text" 'restart_tunnel' '提供 restart 子命令'
 assert_contains "$script_text" 'show_tunnel_logs' '提供 logs 子命令'
 assert_contains "$script_text" 'service_mode_label' '托管方式名称供状态与一键脚本复用'
+assert_contains "$script_text" 'check_ssh_login' '安装前做 SSH 登录体检'
+assert_contains "$script_text" 'manage_credentials' '提供 credentials 子命令'
+assert_contains "$script_text" 'generate_password' '内置随机密码生成'
+assert_contains "$script_text" 'password_login_allowed' '检查 sshd 是否允许密码登录'
+assert_contains "$script_text" 'user_has_password' '检查账户是否已有可用密码'
+assert_contains "$script_text" 'authorized_key_lines' '解析已授权公钥'
+assert_contains "$script_text" 'ssh-keygen -lf' '打印已授权公钥指纹'
+assert_contains "$script_text" 'sshd -T' '以 sshd 有效配置判断认证方式'
+assert_contains "$script_text" 'chpasswd' '通过 chpasswd 设置密码'
+assert_contains "$script_text" '不修改 sshd_config' '仍不改动 sshd 配置'
+assert_contains "$script_text" "if [[ -n \"\$SSH_PASSWORD\" ]]; then" '仅在本次生成密码时打印密码'
+assert_not_contains "$script_text" 'SSH_PASSWORD >' '密码不写入任何文件'
+assert_not_contains "$script_text" 'FORCE_PASSWORD" >' '强制设密标记不落盘'
 
 start_text="$(tr -d '\r' <"$START_SCRIPT")"
 assert_contains "$start_text" 'source "$MAIN_SCRIPT"' '一键脚本复用主脚本函数与常量'

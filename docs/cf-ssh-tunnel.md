@@ -54,6 +54,44 @@ ssh.example.com
 
 > 授权期间产生的 `cert.pem` 具有账户级 Tunnel 管理能力。脚本仅在自动创建和 DNS 配置的短暂期间使用它，完成后立即清理；运行服务只保留此 Tunnel 的专用 JSON 凭据。[3]
 
+## 登录信息（脚本会全部打印出来）
+
+安装结束、重复执行 `install`、以及一键脚本 `start.sh` 结束时，都会先做一次「SSH 登录体检」，再把连得上所需的信息一次性打印：
+
+```text
+════════ 连接信息（照着做就能连上） ════════
+
+服务器地址：ssh.example.com（Cloudflare Tunnel 域名）
+登录用户：root
+认证方式：密码
+登录密码：Ab3xK9mQ2pL7wZ4
+    （这是脚本刚设置的密码，只显示这一次，请立刻存下来）
+
+① 一条命令直接连（不改任何配置）：
+    ssh -o ProxyCommand='cloudflared access ssh --hostname %h' root@ssh.example.com
+
+② 写进客户端 ~/.ssh/config（推荐，之后直接 ssh 就能连）：……
+③ 想改用密钥登录（以后不用记密码）：ssh-copy-id -o ProxyCommand=…
+```
+
+体检按下面的顺序判断，并只在必要时改动本机账户：
+
+| 服务器上的状况 | 脚本行为 |
+|---|---|
+| 该账户已有公钥（`~/.ssh/authorized_keys` 有有效条目） | 只列出公钥指纹，**不动密码**；指纹对不上时提示改用密码 |
+| 既没有公钥、密码又是空的/被锁 | 生成 16 位随机密码，写入本机 `/etc/shadow`，**只打印一次**，不写入任何文件 |
+| 既没有公钥、但账户已有密码 | 如实说明「Linux 不保存明文，脚本读不出来」，并提示用 `credentials --set-password` 重置 |
+| sshd 不允许该账户用密码登录 | 不改 `sshd_config`，打印放行所需的 drop-in 命令后退出 |
+
+任何时候都可以重新查看或重置，不用重装：
+
+```bash
+sudo bash scripts/cf-ssh-tunnel.sh credentials                # 域名、用户、认证方式、公钥指纹
+sudo bash scripts/cf-ssh-tunnel.sh credentials --set-password # 生成并设置一个新密码后打印
+```
+
+> 安装时也可以直接指定：`install --set-password`（即使已有公钥也生成密码，两条路都能登）或 `install --no-password`（只体检、绝不改密码）。脚本**不会**修改 `sshd_config`；密码以哈希形式保存在本机 `/etc/shadow`，脚本自身不留任何明文副本。建议连上之后按上面 ③ 换成密钥登录。
+
 ## 连接与安全边界
 
 Tunnel、DNS 和 SSH 路由在输入域名后即全部完成。客户端仍需要安装 `cloudflared` 作为 SSH 的 Tunnel 代理，随后以服务器现有的 Linux SSH 密钥或密码完成认证。[5]
@@ -139,6 +177,7 @@ ssh root@ssh.example.com
 | 重启 Tunnel（容器/机器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
 | 检查网络、SSH 和最近日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
+| 查看登录信息 / 重置登录密码 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password]` |
 | 更新或安装 `cloudflared` | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 查看或开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
 | 输出客户端配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
@@ -156,7 +195,9 @@ ssh root@ssh.example.com
 
 **重复执行 install 会怎样？** 不会重复安装。脚本检测到已有配置时直接加载，显示现有 Tunnel 的域名、UUID、服务状态与连接命令；服务未运行会自动尝试拉起。想彻底重来，先执行 `uninstall`。
 
-**SSH 仍然连接失败。** 先运行 `diagnose`，确认托管服务处于运行状态（systemd 模式看服务 `active`，进程模式看 PID 与日志尾部），再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5]
+**SSH 仍然连接失败。** 先运行 `diagnose`，确认托管服务处于运行状态（systemd 模式看服务 `active`，进程模式看 PID 与日志尾部），再确认客户端 `~/.ssh/config` 中存在 `ProxyCommand cloudflared access ssh --hostname %h`，以及服务器的 SSH 用户、密钥或密码正确。[5] 如果卡在 `Permission denied (publickey,password)`，说明链路是通的、只是认证没对上：运行 `credentials` 看服务器上有哪些公钥；都不是你的就用 `credentials --set-password` 生成一个密码再连。
+
+**登录密码是多少？脚本读不出服务器上原有的密码。** Linux 只保存哈希，任何工具都无法还原明文。三种处理：用你当初设置的那个密码；用自己手上的私钥（`credentials` 会列出服务器已授权的公钥指纹）；或者执行 `credentials --set-password` 重置为一个新密码——脚本会把新密码打印出来，且只打印这一次。若提示 sshd 不允许密码登录，按输出里的 drop-in 命令放行后重试（脚本不代改 `sshd_config`）。
 
 **容器里提示「未检测到正在运行的 systemd」。** 这不是错误。脚本会自动改用后台看护进程继续安装：Tunnel 崩溃后会自动重启，容器/机器重启后首次登录 shell 会自动拉起。若提示未检测到 22 端口的 SSH 服务，请先在容器内启动 `sshd`，否则 Tunnel 没有可转发的目标。
 

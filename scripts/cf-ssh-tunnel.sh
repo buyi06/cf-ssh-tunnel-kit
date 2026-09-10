@@ -36,6 +36,11 @@ SERVICE_MODE=''
 SERVICE_GROUP='root'
 CREDENTIAL_MODE='0600'
 RELEASE_PAGE_URL=''
+SSHD_CONFIG_FILE=''
+SSH_AUTH_METHOD=''
+SSH_PASSWORD=''
+FORCE_PASSWORD=0
+NO_PASSWORD=0
 CF_BIN=''
 PACKAGE_MANAGER=''
 TUNNEL_UUID=''
@@ -81,6 +86,7 @@ usage() {
   sudo bash cf-ssh-tunnel.sh logs
   sudo bash cf-ssh-tunnel.sh restart
   sudo bash cf-ssh-tunnel.sh diagnose
+  sudo bash cf-ssh-tunnel.sh credentials [--set-password]
   sudo bash cf-ssh-tunnel.sh update
   sudo bash cf-ssh-tunnel.sh autostart [--show|--enable|--disable]
   sudo bash cf-ssh-tunnel.sh github-proxy [--show|--disable]
@@ -98,10 +104,13 @@ usage() {
   --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络。
   --auto         先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2（默认）。
   --quic         固定使用 QUIC（UDP/7844）。
+  --set-password 额外生成一个随机登录密码并打印（即使本机已有公钥）。
+  --no-password  不设置密码，只检查并显示现有登录方式。
   status         显示 Tunnel 名称、域名、托管方式、进程状态和本机 SSH 状态。
   logs           查看最近 80 行 Tunnel 日志：systemd 用 journalctl，进程模式读日志文件。
   restart        重启 Tunnel 服务，systemd 与进程模式都可用；容器重启后也用它重新拉起。
   diagnose       检查 DNS、TCP/7844、本机 SSH 和最近服务日志；不会修改配置。
+  credentials    显示登录所需的全部信息（域名、用户名、认证方式、已授权公钥指纹）；带上 --set-password 会生成并设置一个新密码后打印。
   update         使用系统包管理器更新 cloudflared。
   autostart      查看或开关「登录自启」：无 systemd 的环境下，登录 shell 时自动拉起 Tunnel。
   github-proxy   测试候选 GitHub 代理，自动选择低延迟可用项并全局加速 GitHub Git 克隆；--show 查看，--disable 关闭。
@@ -118,6 +127,8 @@ usage() {
 
 安全说明：
   本脚本不会开放服务器入站端口，不修改 sshd_config，也不创建裸 TCP/22 公网转发。
+  若目标账户既没有公钥、也没有可用密码，脚本会生成一个随机密码写入本机 /etc/shadow 并只打印一次，
+  保证 Tunnel 建好后立刻能登录（用 --no-password 关闭该行为，用 --set-password 强制重置密码）。
   脚本会自动创建 Tunnel、DNS 路由和 ssh://localhost:22 配置；连接继续使用 Linux 原有的 SSH 密钥或密码认证。
   GitHub 代理仅影响 Git 的 github.com 克隆与拉取（git push 仍直连 GitHub），不设置 HTTP(S)_PROXY，不代理系统更新、Cloudflare 授权或其他网络流量。
 EOF
@@ -592,6 +603,101 @@ check_local_ssh() {
   return 1
 }
 
+login_user_home() {
+  local user="$1" home=''
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  printf '%s' "${home:-/root}"
+}
+
+authorized_key_lines() {
+  [[ -r "$1" ]] || return 0
+  grep -E '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-(ssh-ed25519|ecdsa-sha2))' "$1" 2>/dev/null || true
+}
+
+user_has_password() {
+  local user="$1" field=''
+  # 直接读 /etc/shadow：以 ! 或 * 开头表示已锁定/无可用密码，此时密码登录必然失败。
+  [[ -r /etc/shadow ]] || return 1
+  field="$(awk -F: -v u="$user" '$1 == u { print $2 }' /etc/shadow 2>/dev/null || true)"
+  [[ -n "$field" && "$field" != '!'* && "$field" != '*'* ]]
+}
+
+password_login_allowed() {
+  local user="$1" effective=''
+  # SSHD_CONFIG_FILE 仅用于测试与特殊部署：留空时读取系统 sshd 有效配置。
+  if [[ -n "$SSHD_CONFIG_FILE" ]]; then
+    effective="$(sshd -T -f "$SSHD_CONFIG_FILE" 2>/dev/null || true)"
+  else
+    effective="$(sshd -T 2>/dev/null || true)"
+  fi
+  # 无法读取有效配置时不阻塞流程，交由用户按提示判断。
+  [[ -n "$effective" ]] || return 0
+  grep -qi '^passwordauthentication yes' <<<"$effective" || return 1
+  if [[ "$user" == 'root' ]]; then
+    grep -qi '^permitrootlogin yes' <<<"$effective" || return 1
+  fi
+  return 0
+}
+
+generate_password() {
+  local password=''
+  if command -v openssl >/dev/null 2>&1; then
+    password="$(openssl rand -base64 24 2>/dev/null | tr -d '\n/+=' | cut -c1-16 || true)"
+  fi
+  if [[ -z "$password" ]]; then
+    password="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || true)"
+  fi
+  [[ -n "$password" ]] || die '无法生成随机密码（缺少 openssl 且 /dev/urandom 不可读）。'
+  printf '%s' "$password"
+}
+
+check_ssh_login() {
+  local user="$1" home authorized='' key_count=0
+  home="$(login_user_home "$user")"
+  authorized="${home}/.ssh/authorized_keys"
+  key_count="$(authorized_key_lines "$authorized" | grep -c . || true)"
+
+  if (( key_count > 0 )); then
+    SSH_AUTH_METHOD='key'
+    info "服务器账户 ${user} 已配置 ${key_count} 个公钥，可用对应私钥直接登录。"
+    if (( FORCE_PASSWORD == 0 )); then
+      return 0
+    fi
+    warn '已指定 --set-password，将额外设置一个密码，两种方式都能登录。'
+  fi
+
+  if (( NO_PASSWORD == 1 )); then
+    warn '已指定 --no-password，脚本不会设置密码；请自行准备 SSH 密钥或密码。'
+    return 0
+  fi
+
+  if (( FORCE_PASSWORD == 0 )) && (( key_count == 0 )) && user_has_password "$user"; then
+    SSH_AUTH_METHOD='password'
+    warn "服务器账户 ${user} 已有密码；Linux 不保存明文，脚本无法读出，请用你设置过的那个密码登录。"
+    info "忘记或不知道密码时执行：sudo bash $0 credentials --set-password（重置为新密码并立即打印）"
+    return 0
+  fi
+
+  if ! password_login_allowed "$user"; then
+    warn "服务器 sshd 当前不允许账户 ${user} 使用密码登录，脚本不会代改 sshd_config。"
+    say '如需改用密码登录，请在服务器上执行（Debian/Ubuntu/RHEL9 等支持 sshd_config.d 的系统）：'
+    say "    printf 'PasswordAuthentication yes\\nPermitRootLogin yes\\n' > /etc/ssh/sshd_config.d/99-cf-ssh-tunnel.conf"
+    say '    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || kill -HUP "$(pgrep -x sshd | head -n 1)"'
+    say '    （老系统需手工修改 /etc/ssh/sshd_config 中对应的行，sshd 只认第一个出现的同名项）'
+    say "然后执行：sudo bash $0 credentials --set-password"
+    return 0
+  fi
+
+  SSH_PASSWORD="$(generate_password)"
+  printf '%s:%s\n' "$user" "$SSH_PASSWORD" | chpasswd || die "设置账户 ${user} 的密码失败。"
+  SSH_AUTH_METHOD='password'
+  say
+  info "已为服务器账户 ${user} 设置登录密码（只保存在本机 /etc/shadow，脚本不写入任何文件）："
+  say "    用户名：${user}"
+  say "    密码：${SSH_PASSWORD}"
+  say '    请立刻保存上面的密码，脚本不会再次显示它。'
+}
+
 validate_hostname() {
   local host="$1"
   [[ ${#host} -le 253 && "$host" == *.* ]] || return 1
@@ -1057,20 +1163,58 @@ show_tunnel_logs() {
 }
 
 print_connection_info() {
-  local user="${1:-root}"
-  say '── SSH 连接信息（可直接复制使用） ──'
+  local user="${1:-root}" home='' authorized=''
+  say '════════ 连接信息（照着做就能连上） ════════'
   say
-  say '把以下内容追加到客户端电脑的 ~/.ssh/config（客户端也需安装 cloudflared）：'
+  if [[ -n "$PUBLIC_HOSTNAME" ]]; then
+    say "服务器地址：${PUBLIC_HOSTNAME}（Cloudflare Tunnel 域名）"
+  else
+    say '服务器地址：尚未创建 Tunnel（执行 install 后这里会显示域名）'
+  fi
+  say "登录用户：${user}"
+  case "$SSH_AUTH_METHOD" in
+    key)
+      say '认证方式：公钥（用你手上对应的私钥登录，不需要密码）'
+      home="$(login_user_home "$user")"
+      authorized="${home}/.ssh/authorized_keys"
+      if [[ -r "$authorized" ]]; then
+        say "服务器已授权的公钥（${authorized}）："
+        ssh-keygen -lf "$authorized" 2>/dev/null | sed 's/^/    /' || true
+        say '    指纹对不上？说明这些都不是你的密钥，可执行 credentials --set-password 改用密码登录。'
+      fi
+      ;;
+    password)
+      say '认证方式：密码'
+      if [[ -n "$SSH_PASSWORD" ]]; then
+        say "登录密码：${SSH_PASSWORD}"
+        say '    （这是脚本刚设置的密码，只显示这一次，请立刻存下来）'
+      else
+        say '登录密码：服务器上原有的密码（脚本读不到明文，用你设置过的那个）'
+      fi
+      ;;
+    *)
+      say '认证方式：沿用服务器上原有的 SSH 密钥或密码'
+      say '    想看服务器上到底有哪些公钥、或重置密码：sudo bash '"$0"' credentials'
+      ;;
+  esac
   say
-  say "Host ${PUBLIC_HOSTNAME}"
-  say "    HostName ${PUBLIC_HOSTNAME}"
-  say "    User ${user}"
-  say '    ProxyCommand cloudflared access ssh --hostname %h'
+  if [[ -z "$PUBLIC_HOSTNAME" ]]; then
+    return 0
+  fi
+  say '客户端（Windows / macOS / Linux，需先自行安装 cloudflared）任选一种：'
   say
-  say "随后即可连接：ssh ${user}@${PUBLIC_HOSTNAME}"
+  say '① 一条命令直接连（不改任何配置）：'
+  say "    ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ${user}@${PUBLIC_HOSTNAME}"
   say
-  say '不想改配置文件时，一条命令直连：'
-  say "ssh -o ProxyCommand='cloudflared access ssh --hostname %h' ${user}@${PUBLIC_HOSTNAME}"
+  say '② 写进客户端 ~/.ssh/config（推荐，之后直接 ssh 就能连）：'
+  say "    Host ${PUBLIC_HOSTNAME}"
+  say "        HostName ${PUBLIC_HOSTNAME}"
+  say "        User ${user}"
+  say '        ProxyCommand cloudflared access ssh --hostname %h'
+  say "    然后执行：ssh ${user}@${PUBLIC_HOSTNAME}"
+  say
+  say '③ 想改用密钥登录（以后不用记密码）：'
+  say "    ssh-copy-id -o ProxyCommand='cloudflared access ssh --hostname %h' ${user}@${PUBLIC_HOSTNAME}"
   say
   say "认证沿用服务器上 ${user} 原有的 SSH 密钥或密码；要换登录用户，改掉 User 和命令里的 ${user} 即可。"
 }
@@ -1080,7 +1224,10 @@ show_connection_notice() {
   say '第 4 步：Tunnel 已自动配置完成。'
   print_connection_info "${INSTALL_USER:-root}"
   say
-  warn '该 SSH 域名现在可从 Internet 访问。请确认已使用强 SSH 密钥，并禁用不需要的密码或 root 登录。'
+  warn '该 SSH 域名现在可从 Internet 访问：请使用强密码或密钥登录，并保持系统更新。'
+  if [[ -n "$SSH_PASSWORD" ]]; then
+    say '    本次生成的是 16 位随机密码；想更省事可按上面 ③ 改用密钥登录。'
+  fi
   info '为降低风险，授权期间使用的账户级证书已自动删除；运行服务只保留本 Tunnel 的专用凭据。'
 }
 
@@ -1119,6 +1266,9 @@ load_existing_install() {
       die "服务启动失败。请执行 '$0 diagnose' 排查网络与服务日志。"
     fi
   fi
+  say
+  say '== SSH 登录体检 =='
+  check_ssh_login "${INSTALL_USER:-root}"
   print_connection_info "${INSTALL_USER:-root}"
   say
   say "查看详细状态：sudo bash $0 status；按需生成客户端配置：bash $0 client-config ${PUBLIC_HOSTNAME} [用户名]"
@@ -1132,6 +1282,8 @@ install_tunnel() {
       --mainland) PROTOCOL='http2' ;;
       --auto) PROTOCOL='auto' ;;
       --quic) PROTOCOL='quic' ;;
+      --set-password) FORCE_PASSWORD=1 ;;
+      --no-password) NO_PASSWORD=1 ;;
       -h|--help) usage; return 0 ;;
       *) die "未知 install 选项：$1" ;;
     esac
@@ -1149,6 +1301,9 @@ install_tunnel() {
   check_local_ssh || die 'SSH 未就绪，拒绝创建没有本机 SSH 服务的 Tunnel。'
   resolve_service_identity
   INSTALL_USER="${SUDO_USER:-$(id -un)}"
+  say
+  say '== SSH 登录体检 =='
+  check_ssh_login "$INSTALL_USER"
   if [[ "$PROTOCOL" == 'http2' ]]; then
     show_mainland_notice
     configure_github_proxy
@@ -1186,6 +1341,7 @@ status_tunnel() {
   say "Tunnel UUID：${TUNNEL_UUID}"
   say "SSH 域名：${PUBLIC_HOSTNAME}"
   say "传输协议：${PROTOCOL}"
+  say "登录用户：${INSTALL_USER:-root}（认证方式与密码：sudo bash $0 credentials）"
   say "托管方式：$(service_mode_label)"
   say "凭据文件权限：$(stat -c '%a %U:%G %n' "${SERVICE_DIR}/${TUNNEL_UUID}.json" 2>/dev/null || echo '文件缺失')"
   say
@@ -1301,6 +1457,25 @@ Host ${hostname}
 EOF
 }
 
+manage_credentials() {
+  local user=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --set-password) FORCE_PASSWORD=1 ;;
+      --show) : ;;
+      *) die 'credentials 仅支持 --show 或 --set-password。' ;;
+    esac
+    shift
+  done
+  require_root
+  read_metadata || true
+  user="${INSTALL_USER:-root}"
+  say '== SSH 登录体检 =='
+  check_ssh_login "$user"
+  say
+  print_connection_info "$user"
+}
+
 uninstall_tunnel() {
   require_root
   detect_service_mode
@@ -1340,6 +1515,7 @@ main() {
     logs) [[ $# -eq 0 ]] || die 'logs 不接受额外参数。'; show_tunnel_logs ;;
     restart) [[ $# -eq 0 ]] || die 'restart 不接受额外参数。'; restart_tunnel ;;
     diagnose) [[ $# -eq 0 ]] || die 'diagnose 不接受额外参数。'; diagnose_tunnel ;;
+    credentials) [[ $# -le 1 ]] || die 'credentials 最多接受一个选项。'; manage_credentials "$@" ;;
     update) [[ $# -eq 0 ]] || die 'update 不接受额外参数。'; update_cloudflared ;;
     autostart) [[ $# -le 1 ]] || die 'autostart 最多接受一个选项。'; manage_autostart "${1:-}" ;;
     github-proxy) [[ $# -le 1 ]] || die 'github-proxy 最多接受一个选项。'; manage_github_proxy "${1:-}" ;;

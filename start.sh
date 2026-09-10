@@ -25,9 +25,12 @@ usage() {
 用法：
   sudo bash start.sh [--mainland|--auto|--quic] [--no-update]
 
-一条命令完成：更新项目代码 → 安装或拉起 Tunnel → 打印可直接复制的 SSH 连接信息。
+一条命令完成：更新项目代码 → 安装或拉起 Tunnel → 打印可直接复制的连接信息。
 首次运行等价于 install（含浏览器授权）；已安装过时只加载现有配置，服务没在跑才拉起，
 不会重复创建 Tunnel 或 DNS 记录。
+
+结束时会打印登录所需的全部信息：域名、登录用户、认证方式（公钥指纹或密码），
+以及客户端可直接复制的 ssh 命令与 ~/.ssh/config 片段。
 
   --mainland   固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络（默认）。
   --auto       先尝试 QUIC，UDP 不可用时由 cloudflared 回退 HTTP/2。
@@ -116,6 +119,9 @@ load_or_install() {
     warn 'Tunnel 服务未在运行，正在拉起……'
     bash "$MAIN_SCRIPT" restart
   fi
+  say
+  say '== SSH 登录体检 =='
+  check_ssh_login "${INSTALL_USER:-root}"
   print_connection_info "${INSTALL_USER:-root}"
   say
   say "查看状态：sudo bash ${MAIN_SCRIPT} status；查看日志：sudo bash ${MAIN_SCRIPT} logs"

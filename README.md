@@ -41,7 +41,14 @@ sudo bash start.sh
 | 1. 检查环境 | 无需操作。 | 检查本机 SSH、DNS、Cloudflare TCP/7844；检测 `cloudflared`，未安装时自动安装。 |
 | 2. Cloudflare 授权 | 复制终端显示的 `https://...` 链接，在任意浏览器打开并选择站点。 | 等待授权成功，不需要服务器显示器。 |
 | 3. 填写域名 | 输入完整域名，例如 `ssh.example.com`。 | 创建 Tunnel、自动写 DNS CNAME、生成 `ssh://localhost:22` ingress、校验配置、启动托管服务。 |
-| 4. 直接连接 | 无需额外控制台设置。 | 输出客户端 SSH 配置模板；继续使用服务器原有的 SSH 密钥或密码认证。 |
+| 4. 直接连接 | 照抄终端打印的信息即可。 | 打印域名、登录用户、认证方式（已授权公钥指纹，或新生成的密码）和三种可直接复制的连接方式。 |
+
+> **登录信息全在最后一段输出里**：服务器地址、用户名、认证方式（公钥指纹 / 密码），以及「一条命令直连」「写进 `~/.ssh/config`」「改用密钥」三种做法。如果该账户既没有公钥也没有可用密码，脚本会生成一个 16 位随机密码、写入本机 `/etc/shadow` 并**只打印这一次**（不会落到任何文件）；已经有公钥时不会碰密码。随时可以重新查看或重置：
+>
+> ```bash
+> sudo bash scripts/cf-ssh-tunnel.sh credentials                # 域名、用户、认证方式、已授权公钥指纹
+> sudo bash scripts/cf-ssh-tunnel.sh credentials --set-password # 生成新密码并打印
+> ```
 
 > `--mainland` 使用 HTTP/2/TCP 7844，适合 UDP/QUIC 不稳定的网络。它不保证任何网络一定可连，也不会绕过网络限制。默认 `--auto` 会优先 QUIC，失败时回退 HTTP/2。[1]
 
@@ -117,6 +124,7 @@ ssh root@ssh.example.com
 | 检查网络、SSH 和日志 | `sudo bash scripts/cf-ssh-tunnel.sh diagnose` |
 | 更新或安装 cloudflared | `sudo bash scripts/cf-ssh-tunnel.sh update` |
 | 查看/开关登录自启（无 systemd 环境） | `sudo bash scripts/cf-ssh-tunnel.sh autostart [--show\|--enable\|--disable]` |
+| 查看登录信息 / 重置登录密码 | `sudo bash scripts/cf-ssh-tunnel.sh credentials [--set-password]` |
 | 输出客户端 SSH 配置 | `bash scripts/cf-ssh-tunnel.sh client-config` |
 | 删除本机服务与专用凭据 | `sudo bash scripts/cf-ssh-tunnel.sh uninstall` |
 
