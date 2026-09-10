@@ -7,24 +7,32 @@
 ## 一条命令开始
 
 ```bash
-git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git 2>/dev/null || true
+git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git
 cd cf-ssh-tunnel-kit
-git pull --ff-only
-sudo bash scripts/cf-ssh-tunnel.sh install --mainland
+sudo bash start.sh
 ```
 
-> 这四行可以整段重复粘贴执行：目录已存在时跳过克隆，`git pull` 更新到最新版，`install` 检测到本机已配置过时直接显示现有 Tunnel 状态和连接命令，**不会重复安装**。
+[`start.sh`](start.sh) 是一键启动脚本：**更新代码 → 首次安装（含浏览器授权）→ 服务没在跑就拉起 → 打印可直接复制的 SSH 连接信息**，可以反复执行。
 
-中国大陆直连 `github.com` 超时（出现 `Failed to connect to github.com port 443`）时，第一次克隆改用加速地址，并把 `origin` 改回官方地址：
+| 执行时的状态 | `sudo bash start.sh` 会做什么 |
+|---|---|
+| 首次运行 | 安装 cloudflared、给出授权链接、创建 Tunnel 与 DNS 路由、启动托管服务 |
+| 已安装且服务在运行 | 只更新代码并重新打印连接信息，不动现有 Tunnel |
+| 已安装但服务没跑（容器重启后等） | 自动拉起 Tunnel，再打印连接信息 |
+
+可选参数：`--auto` / `--quic` 切换传输协议（默认 `--mainland`），`--no-update` 跳过代码更新。
+
+> 不想用一键脚本时，等价的手工命令是 `sudo bash scripts/cf-ssh-tunnel.sh install --mainland`；已安装过时该命令会直接加载现有配置，不会重复安装。
+
+中国大陆直连 `github.com` 超时（出现 `Failed to connect to github.com port 443`）时，第一次克隆改用加速地址即可，**不需要**再手工切换 `origin`：
 
 ```bash
 git clone https://gh-proxy.org/https://github.com/buyi06/cf-ssh-tunnel-kit.git
 cd cf-ssh-tunnel-kit
-git remote set-url origin https://github.com/buyi06/cf-ssh-tunnel-kit.git
-sudo bash scripts/cf-ssh-tunnel.sh install --mainland
+sudo bash start.sh
 ```
 
-> `install --mainland` 会自动测速并配置 Git 加速，因此**安装之后**的 `git pull` 才会走代理；安装前的那次 `git pull` 仍然可能超时，可跳过。
+> `start.sh` 每次运行都会先探测直连，连不通才自动测速并**临时**借用加速代理拉取代码（不写入全局 Git 配置、不改动 `origin`），因此之后的更新也不用再手工处理。
 
 执行后，脚本会按中文提示完成以下流程：
 
@@ -60,7 +68,8 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 | 重启后 | 自动拉起 | **不会自动拉起**，需重新执行 `restart` |
 
 ```bash
-sudo bash scripts/cf-ssh-tunnel.sh restart   # 容器/机器重启后重新拉起
+sudo bash start.sh                           # 一键：更新代码 + 拉起 Tunnel + 打印连接信息
+sudo bash scripts/cf-ssh-tunnel.sh restart   # 只重启 Tunnel 服务
 sudo bash scripts/cf-ssh-tunnel.sh logs      # 查看最近 80 行日志
 sudo bash scripts/cf-ssh-tunnel.sh status    # 显示托管方式、PID 与进程状态
 ```
@@ -97,6 +106,7 @@ ssh root@ssh.example.com
 
 | 用途 | 命令 |
 |---|---|
+| 一键更新 + 安装/拉起 + 打印连接信息 | `sudo bash start.sh` |
 | 查看托管方式、服务状态、Tunnel UUID 与域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
 | 重启 Tunnel（容器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |

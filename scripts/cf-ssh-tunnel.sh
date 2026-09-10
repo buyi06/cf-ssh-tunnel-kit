@@ -87,6 +87,9 @@ usage() {
 最简单的安装方式：
   sudo bash cf-ssh-tunnel.sh install --mainland
 
+在项目根目录一键启动（自动更新代码 + 安装或拉起现有 Tunnel + 打印连接信息）：
+  sudo bash start.sh
+
 命令说明：
   install        首次运行：自动安装 cloudflared、输出浏览器授权链接并创建 Tunnel、DNS 路由、SSH 配置和托管服务。本机已配置过时直接加载现有状态与连接方式，不会重复安装。
   --mainland     固定使用 HTTP/2（TCP/7844），适合 UDP/QUIC 不稳定的网络。
@@ -126,6 +129,14 @@ detect_service_mode() {
     SERVICE_MODE='systemd'
   else
     SERVICE_MODE='process'
+  fi
+}
+
+service_mode_label() {
+  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    printf '%s' 'systemd 服务'
+  else
+    printf '%s' '后台进程（未检测到 systemd）'
   fi
 }
 
@@ -906,6 +917,7 @@ restart_tunnel() {
   detect_service_mode
   read_metadata || die "未发现本机 Tunnel 配置（${META_FILE}）。请先执行 install。"
   if [[ "$SERVICE_MODE" == 'systemd' ]]; then
+    [[ -e "$UNIT_FILE" ]] || die "检测到本机配置但缺少 systemd 服务文件（可能是上次未完成的安装，或配置来自容器环境）。请执行 'sudo bash $0 uninstall' 清理后重新 install。"
     systemctl restart "$SERVICE_NAME"
   else
     find_cloudflared || die '未找到 cloudflared，无法重启 Tunnel；请先执行 update。'
@@ -1041,12 +1053,9 @@ install_tunnel() {
 }
 
 status_tunnel() {
-  local service_mode_text='后台进程（未检测到 systemd）' pid=''
+  local pid=''
   require_root
   detect_service_mode
-  if [[ "$SERVICE_MODE" == 'systemd' ]]; then
-    service_mode_text='systemd 服务'
-  fi
   if ! read_metadata; then
     warn "未发现 ${SERVICE_NAME} 的本地配置。"
     return 1
@@ -1060,7 +1069,7 @@ status_tunnel() {
   say "Tunnel UUID：${TUNNEL_UUID}"
   say "SSH 域名：${PUBLIC_HOSTNAME}"
   say "传输协议：${PROTOCOL}"
-  say "托管方式：${service_mode_text}"
+  say "托管方式：$(service_mode_label)"
   say "凭据文件权限：$(stat -c '%a %U:%G %n' "${SERVICE_DIR}/${TUNNEL_UUID}.json" 2>/dev/null || echo '文件缺失')"
   say
   if [[ "$SERVICE_MODE" == 'systemd' ]]; then

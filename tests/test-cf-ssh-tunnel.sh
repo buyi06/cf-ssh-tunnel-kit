@@ -4,6 +4,7 @@ IFS=$'\n\t'
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${ROOT_DIR}/scripts/cf-ssh-tunnel.sh"
+START_SCRIPT="${ROOT_DIR}/start.sh"
 
 pass_count=0
 fail() {
@@ -32,6 +33,8 @@ assert_status() {
 
 bash -n "$SCRIPT"
 pass 'Bash 语法检查'
+bash -n "$START_SCRIPT"
+pass 'start.sh 语法检查'
 
 help_output="$(bash "$SCRIPT" help)"
 assert_contains "$help_output" 'install [--mainland|--auto|--quic]' '帮助文本包含安装模式'
@@ -45,6 +48,21 @@ assert_contains "$help_output" 'logs           查看最近 80 行 Tunnel 日志
 assert_contains "$help_output" '改用独立后台进程托管' '帮助文本说明非 systemd 托管方式'
 assert_contains "$help_output" '容器、DSW/Colab、WSL 等没有 systemd 的' '帮助文本点名无 systemd 的典型环境'
 assert_contains "$help_output" '/etc/cf-ssh-tunnel/tunnel.log' '帮助文本给出进程模式日志路径'
+assert_contains "$help_output" 'sudo bash start.sh' '帮助文本指向一键启动脚本'
+
+start_help="$(bash "$START_SCRIPT" --help)"
+assert_contains "$start_help" 'sudo bash start.sh [--mainland|--auto|--quic] [--no-update]' '一键脚本帮助包含完整用法'
+assert_contains "$start_help" '首次运行等价于 install' '一键脚本说明首次运行行为'
+assert_contains "$start_help" '不会重复创建 Tunnel 或 DNS 记录' '一键脚本说明重复执行行为'
+assert_contains "$start_help" '改用候选加速代理拉取代码' '一键脚本说明代理回退'
+
+set +e
+bash "$START_SCRIPT" --unexpected-option >/tmp/cf-ssh-tunnel-start.stderr 2>&1
+start_unknown_status=$?
+set -e
+assert_status 1 "$start_unknown_status" '一键脚本拒绝未知选项'
+assert_contains "$(cat /tmp/cf-ssh-tunnel-start.stderr)" '未知选项' '一键脚本未知选项错误信息'
+rm -f /tmp/cf-ssh-tunnel-start.stderr
 
 client_output="$(bash "$SCRIPT" client-config ssh.example.com)"
 assert_contains "$client_output" 'ProxyCommand cloudflared access ssh --hostname %h' '客户端配置包含 Tunnel ProxyCommand'
@@ -216,5 +234,20 @@ assert_contains "$script_text" 'fetch_release_page' 'Release 元数据支持经�
 assert_contains "$script_text" 'releases/tag/[0-9]{4}' '经代理取回时从页面解析版本号'
 assert_contains "$script_text" 'restart_tunnel' '提供 restart 子命令'
 assert_contains "$script_text" 'show_tunnel_logs' '提供 logs 子命令'
+assert_contains "$script_text" 'service_mode_label' '托管方式名称供状态与一键脚本复用'
+
+start_text="$(tr -d '\r' <"$START_SCRIPT")"
+assert_contains "$start_text" 'source "$MAIN_SCRIPT"' '一键脚本复用主脚本函数与常量'
+assert_contains "$start_text" 'trap - ERR EXIT HUP INT TERM' '一键脚本不继承主脚本陷阱'
+assert_contains "$start_text" 'GITHUB_PROXY_CANDIDATES' '一键脚本复用候选代理列表'
+assert_contains "$start_text" 'ls-remote --exit-code origin HEAD' '先探测直连再决定是否走代理'
+assert_contains "$start_text" 'pull --ff-only' '一键脚本快进拉取更新'
+assert_contains "$start_text" 'insteadOf=${GITHUB_PREFIX}' '经代理拉取使用临时 URL 改写'
+assert_not_contains "$start_text" 'remote set-url' '一键脚本不要求手工切换 origin 地址'
+assert_not_contains "$start_text" 'curl' '一键脚本不通过 curl 管道执行远程脚本'
+assert_contains "$start_text" 'install "$protocol"' '未安装时进入安装流程'
+assert_contains "$start_text" 'service_is_active' '已在运行时不重复重启'
+assert_contains "$start_text" 'bash "$MAIN_SCRIPT" restart' '未运行时拉起现有 Tunnel'
+assert_contains "$start_text" 'print_connection_info' '一键脚本结束时打印连接信息'
 
 printf '所有 %d 项无网络回归测试通过。\n' "$pass_count"

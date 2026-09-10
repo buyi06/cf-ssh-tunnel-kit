@@ -22,16 +22,25 @@
 
 ## 小白安装步骤
 
-在服务器上克隆项目并运行一条命令。中国大陆网络或已知 UDP 不稳定时优先用 `--mainland`：
+在服务器上克隆项目，然后运行一键启动脚本：
 
 ```bash
-git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git 2>/dev/null || true
+git clone https://github.com/buyi06/cf-ssh-tunnel-kit.git
 cd cf-ssh-tunnel-kit
-git pull --ff-only
-sudo bash scripts/cf-ssh-tunnel.sh install --mainland
+sudo bash start.sh
 ```
 
-> 这段命令可以重复执行：目录已存在时跳过克隆，`git pull` 更新到最新版；`install` 检测到本机已配置过时直接加载现有状态，不会重复安装。
+一键脚本按顺序完成：**更新代码 → 首次安装（含浏览器授权）→ 服务没在跑就拉起 → 打印可直接复制的 SSH 连接信息**。
+
+| 执行时的状态 | `sudo bash start.sh` 的行为 |
+|---|---|
+| 首次运行 | 等价于 `install --mainland`：安装、授权、创建 Tunnel 与 DNS、启动托管服务 |
+| 已安装且服务在运行 | 只更新代码并重新打印连接信息，不重启、不改动现有 Tunnel |
+| 已安装但服务没跑（容器重启后等） | 自动拉起 Tunnel，再打印连接信息 |
+
+参数：`--mainland`（默认）/ `--auto` / `--quic` 选择传输协议，`--no-update` 跳过代码更新。它每次运行都会先探测 GitHub 直连，连不通才自动测速并**临时**借用候选加速代理拉取代码——不写入全局 Git 配置，也不改动 `origin`，因此大陆网络下可以一直用同一条命令。
+
+> 不想用一键脚本时，等价的手工命令是 `sudo bash scripts/cf-ssh-tunnel.sh install --mainland`；脚本会检测本机是否已配置过，不会重复安装。
 
 脚本会全程显示中文提示。若系统尚未安装 `cloudflared`，会自动安装；若已安装则显示版本并跳过。随后终端会出现 Cloudflare 提供的 `https://...` 授权链接。复制它并在任意可联网设备的浏览器中打开，登录 Cloudflare，并选择目标域名所在站点。不要关闭服务器终端；浏览器授权完成后，脚本会自动继续。
 
@@ -67,12 +76,12 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 
 > 这些是第三方 GitHub 加速服务。脚本只验证 Git 协议响应与延迟，不能把第三方代理变成代码来源信任锚。生产环境应固定经过审核的提交或发布版本，并审阅脚本后再以 root 执行。
 
-> 注意加速规则是在 `install --mainland` **运行之后**才写入的。第一次克隆本仓库时若直连 GitHub 超时，请改用加速地址克隆并把 `origin` 改回官方地址：
+> 上面的加速规则是在 `install --mainland` **运行之后**才写入全局 Git 配置的，供你自己的仓库操作使用。本项目的一键脚本 [`start.sh`](../start.sh) 不依赖它：它每次先探测直连，连不通才临时借用候选代理拉取代码，且不改动 `origin` 与全局配置。因此第一次克隆若直连超时，改用加速地址克隆一次即可，之后一直用同一条启动命令：
 >
 > ```bash
 > git clone https://gh-proxy.org/https://github.com/buyi06/cf-ssh-tunnel-kit.git
 > cd cf-ssh-tunnel-kit
-> git remote set-url origin https://github.com/buyi06/cf-ssh-tunnel-kit.git
+> sudo bash start.sh
 > ```
 
 ## 容器等没有 systemd 的环境
@@ -92,8 +101,8 @@ sudo bash scripts/cf-ssh-tunnel.sh github-proxy --disable
 因此容器里同样是一条命令装完即用：
 
 ```bash
-sudo bash scripts/cf-ssh-tunnel.sh install --mainland
-sudo bash scripts/cf-ssh-tunnel.sh restart     # 容器重启后
+sudo bash start.sh                             # 首次安装；容器重启后也可以直接再跑一次
+sudo bash scripts/cf-ssh-tunnel.sh restart     # 只想拉起服务时
 sudo bash scripts/cf-ssh-tunnel.sh logs
 ```
 
@@ -121,6 +130,7 @@ ssh root@ssh.example.com
 
 | 需求 | 命令 |
 |---|---|
+| 一键更新代码 + 安装或拉起 + 打印连接信息 | `sudo bash start.sh` |
 | 查看托管方式、状态、Tunnel UUID、SSH 域名 | `sudo bash scripts/cf-ssh-tunnel.sh status` |
 | 重启 Tunnel（容器/机器重启后也用它） | `sudo bash scripts/cf-ssh-tunnel.sh restart` |
 | 查看最近 80 行日志 | `sudo bash scripts/cf-ssh-tunnel.sh logs` |
